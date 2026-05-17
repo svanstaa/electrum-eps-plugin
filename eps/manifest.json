@@ -1,0 +1,9 @@
+{
+    "name": "eps",
+    "fullname": "Electrum Personal Server",
+    "description": "Connect Electrum to your own Bitcoin Core full node.\nProvides full node security and privacy without revealing your addresses to any third party.",
+    "available_for": ["qt"],
+    "author": "svanstaa",
+    "license": "MIT",
+    "version": "0.1.0"
+}

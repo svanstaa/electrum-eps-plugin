@@ -1,0 +1,34 @@
+name: Build & Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone Electrum (for make_plugin)
+        run: |
+          git clone --depth=1 https://github.com/spesmilo/electrum
+
+      - name: Build plugin zip
+        run: |
+          cd electrum
+          pip install pyqt5 cryptography  # needed by make_plugin
+          ./contrib/make_plugin ../eps
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: eps-*.zip
