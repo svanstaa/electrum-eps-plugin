@@ -21,12 +21,38 @@ import logging
 from typing import Dict, List, Optional, Callable, Any
 
 from .rpc import BitcoinRPC, RPCError
-from .addresses import address_to_scripthash
+from .addresses import address_to_scripthash, scriptpubkey_to_scripthash, ScriptWatcher
 
 logger = logging.getLogger("eps.server")
 
-PROTOCOL_VERSION = "1.4"
+PROTOCOL_VERSION_MIN = "1.4"
+PROTOCOL_VERSION_MAX = "1.7"
+PROTOCOL_VERSION = PROTOCOL_VERSION_MIN  # default for legacy callers
 SERVER_VERSION = "EPS-plugin/0.1.0"
+BLOCK_HEADERS_MAX = 2016
+
+
+def _protocol_tuple(version: str) -> tuple:
+    major, minor = version.split(".", 1)
+    return int(major), int(minor)
+
+
+def _negotiate_protocol(client_version) -> str:
+    """Pick the highest protocol version supported by both sides."""
+    s_min = _protocol_tuple(PROTOCOL_VERSION_MIN)
+    s_max = _protocol_tuple(PROTOCOL_VERSION_MAX)
+    if isinstance(client_version, (list, tuple)) and len(client_version) >= 2:
+        c_min = _protocol_tuple(str(client_version[0]))
+        c_max = _protocol_tuple(str(client_version[1]))
+    elif isinstance(client_version, str):
+        c_min = c_max = _protocol_tuple(client_version)
+    else:
+        c_min = c_max = s_min
+    mutual_lo = max(c_min, s_min)
+    mutual_hi = min(c_max, s_max)
+    if mutual_lo > mutual_hi:
+        raise ElectrumServerError("unsupported protocol version")
+    return f"{mutual_hi[0]}.{mutual_hi[1]}"
 
 
 class ElectrumServerError(Exception):
@@ -73,10 +99,11 @@ def _merkle_branch(txids: List[str], pos: int) -> List[str]:
 
 class ClientState:
     def __init__(self):
-        self.scripthash_subs: set = set()   # scripthashes this client subscribed to
+        self.protocol_version: str = PROTOCOL_VERSION_MIN
+        self.scripthash_subs: set = set()
+        self.scriptpubkey_subs: set = set()   # spk hex strings
+        self.outpoint_subs: set = set()       # (txid, vout) tuples
         self.headers_sub: bool = False
-        # Protects concurrent writes from the per-client handler thread and the
-        # notification thread (both can call conn.sendall on the same socket).
         self.write_lock: threading.Lock = threading.Lock()
 
 
@@ -118,6 +145,10 @@ class ElectrumServer:
 
         # Per-instance scripthash → address cache (populated by register_address)
         self._scripthash_cache: Dict[str, str] = {}
+        self._script_watcher = ScriptWatcher(rpc)
+
+        # Last pushed subscription status (scripthash hex -> status or None)
+        self._status_cache: Dict[str, Optional[str]] = {}
 
         # Notification callbacks set by qt.py (so the GUI can update status)
         self.on_client_connected: Optional[Callable[[str], None]] = None
@@ -289,9 +320,13 @@ class ElectrumServer:
 
     def _method_server_version(self, params, peer):
         client_ver = params[0] if params else "unknown"
-        protocol_ver = params[1] if len(params) > 1 else PROTOCOL_VERSION
-        logger.info(f"{peer}: server.version client={client_ver} proto={protocol_ver}")
-        return [SERVER_VERSION, PROTOCOL_VERSION]
+        client_proto = params[1] if len(params) > 1 else PROTOCOL_VERSION_MIN
+        agreed = _negotiate_protocol(client_proto)
+        state = self._client_state()
+        if state:
+            state.protocol_version = agreed
+        logger.info(f"{peer}: server.version client={client_ver} proto={agreed}")
+        return [SERVER_VERSION, agreed]
 
     def _method_server_banner(self, params, peer):
         info = self.rpc.getblockchaininfo()
@@ -324,13 +359,17 @@ class ElectrumServer:
             "genesis_hash": genesis_hash,
             "hash_function": "sha256",
             "server_version": SERVER_VERSION,
-            "protocol_min": PROTOCOL_VERSION,
-            "protocol_max": PROTOCOL_VERSION,
+            "protocol_min": PROTOCOL_VERSION_MIN,
+            "protocol_max": PROTOCOL_VERSION_MAX,
             "pruning": pruning,
-            "hosts": {},   # we don't advertise alt connection methods
+            "hosts": {},
         }
 
     def _method_server_ping(self, params, peer):
+        state = self._client_state()
+        if state and _protocol_tuple(state.protocol_version) >= (1, 7):
+            pong_len = int(params[0]) if params else 0
+            return {"data": "0" * pong_len}
         return None
 
     def _method_server_peers_subscribe(self, params, peer):
@@ -359,40 +398,52 @@ class ElectrumServer:
         return self._scripthash_status(scripthash)
 
     def _method_blockchain_scripthash_get_history(self, params, peer):
-        scripthash = params[0]
-        return self._get_history(scripthash)
+        return self._get_history(scripthash=params[0])
 
     def _method_blockchain_scripthash_get_balance(self, params, peer):
-        scripthash = params[0]
-        address = self._scripthash_to_address(scripthash)
-        if address is None:
-            return {"confirmed": 0, "unconfirmed": 0}
-
-        # confirmed: minconf=1, maxconf=9999999
-        confirmed_utxos = self.rpc.listunspent(1, 9999999, [address])
-        confirmed = sum(int(round(u["amount"] * 1e8)) for u in confirmed_utxos)
-
-        # unconfirmed: minconf=0, maxconf=0
-        unconfirmed_utxos = self.rpc.listunspent(0, 0, [address])
-        unconfirmed = sum(int(round(u["amount"] * 1e8)) for u in unconfirmed_utxos)
-
-        return {"confirmed": confirmed, "unconfirmed": unconfirmed}
+        return self._get_balance(scripthash=params[0])
 
     def _method_blockchain_scripthash_listunspent(self, params, peer):
-        scripthash = params[0]
-        address = self._scripthash_to_address(scripthash)
-        if address is None:
-            return []
-        unspent = self.rpc.listunspent(0, 9999999, [address])
-        result = []
-        for utxo in unspent:
-            result.append({
-                "tx_hash": utxo["txid"],
-                "tx_pos": utxo["vout"],
-                "height": utxo.get("confirmations", 0),  # Core gives confirms, not height
-                "value": int(round(utxo["amount"] * 1e8)),
-            })
-        return result
+        return self._listunspent(scripthash=params[0])
+
+    def _method_blockchain_scriptpubkey_subscribe(self, params, peer):
+        if not params:
+            raise ElectrumServerError("scriptPubKey required")
+        spk_hex = params[0].lower().strip()
+        self._script_watcher.ensure_watched(spk_hex)
+        t = threading.current_thread()
+        with self._clients_lock:
+            entry = self._clients.get(t)
+            if entry:
+                entry[1].scriptpubkey_subs.add(spk_hex)
+        return self._spk_status(spk_hex)
+
+    def _method_blockchain_scriptpubkey_get_history(self, params, peer):
+        spk_hex = params[0].lower().strip()
+        self._script_watcher.ensure_watched(spk_hex)
+        return self._get_history(spk_hex=spk_hex)
+
+    def _method_blockchain_scriptpubkey_get_balance(self, params, peer):
+        spk_hex = params[0].lower().strip()
+        self._script_watcher.ensure_watched(spk_hex)
+        return self._get_balance(spk_hex=spk_hex)
+
+    def _method_blockchain_scriptpubkey_listunspent(self, params, peer):
+        spk_hex = params[0].lower().strip()
+        self._script_watcher.ensure_watched(spk_hex)
+        return self._listunspent(spk_hex=spk_hex)
+
+    def _method_blockchain_outpoint_subscribe(self, params, peer):
+        if len(params) < 2:
+            raise ElectrumServerError("txid and vout required")
+        txid = params[0]
+        vout = int(params[1])
+        t = threading.current_thread()
+        with self._clients_lock:
+            entry = self._clients.get(t)
+            if entry:
+                entry[1].outpoint_subs.add((txid, vout))
+        return self._outpoint_status(txid, vout)
 
     def _method_blockchain_transaction_get(self, params, peer):
         txid = params[0]
@@ -428,15 +479,33 @@ class ElectrumServer:
     def _method_blockchain_block_headers(self, params, peer):
         start = int(params[0])
         count = int(params[1])
-        headers_hex = ""
-        for h in range(start, start + count):
+        state = self._client_state()
+        proto = _protocol_tuple(
+            state.protocol_version if state else PROTOCOL_VERSION_MIN)
+
+        try:
+            tip = self.rpc.getblockcount()
+        except RPCError:
+            tip = start
+
+        end = min(start + count - 1, tip)
+        headers_list: List[str] = []
+        for h in range(start, end + 1):
             try:
                 bh = self.rpc.getblockhash(h)
                 raw = self.rpc.getblock(bh, 0)
-                headers_hex += raw[:160]
+                headers_list.append(raw[:160])
             except RPCError:
                 break
-        return {"hex": headers_hex, "count": len(headers_hex) // 160}
+
+        n = len(headers_list)
+        if proto >= (1, 6):
+            return {"headers": headers_list, "count": n, "max": BLOCK_HEADERS_MAX}
+        return {
+            "hex": "".join(headers_list),
+            "count": n,
+            "max": BLOCK_HEADERS_MAX,
+        }
 
     def _method_blockchain_estimatefee(self, params, peer):
         blocks = int(params[0]) if params else 6
@@ -505,6 +574,11 @@ class ElectrumServer:
         "blockchain.scripthash.get_history":    _method_blockchain_scripthash_get_history,
         "blockchain.scripthash.get_balance":    _method_blockchain_scripthash_get_balance,
         "blockchain.scripthash.listunspent":    _method_blockchain_scripthash_listunspent,
+        "blockchain.scriptpubkey.subscribe":    _method_blockchain_scriptpubkey_subscribe,
+        "blockchain.scriptpubkey.get_history":  _method_blockchain_scriptpubkey_get_history,
+        "blockchain.scriptpubkey.get_balance":  _method_blockchain_scriptpubkey_get_balance,
+        "blockchain.scriptpubkey.listunspent":  _method_blockchain_scriptpubkey_listunspent,
+        "blockchain.outpoint.subscribe":        _method_blockchain_outpoint_subscribe,
         "blockchain.transaction.get":           _method_blockchain_transaction_get,
         "blockchain.transaction.get_merkle":    _method_blockchain_transaction_get_merkle,
         "blockchain.transaction.broadcast":     _method_blockchain_transaction_broadcast,
@@ -520,6 +594,26 @@ class ElectrumServer:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _client_state(self) -> Optional[ClientState]:
+        with self._clients_lock:
+            entry = self._clients.get(threading.current_thread())
+        return entry[1] if entry else None
+
+    def _resolve_query(self, *, scripthash: str = None, spk_hex: str = None):
+        """Return (address, spk_hex) for balance/history queries."""
+        if spk_hex:
+            spk_hex = spk_hex.lower().strip()
+            address = self._script_watcher.address_for_spk(spk_hex)
+            return address, spk_hex
+        if scripthash:
+            address = self._scripthash_to_address(scripthash)
+            if address is None:
+                address = self._script_watcher.address_for_scripthash(scripthash)
+            spk = self._script_watcher.script_for_scripthash(scripthash)
+            spk_hex = spk.hex() if spk else None
+            return address, spk_hex
+        return None, None
 
     def _current_header(self) -> dict:
         try:
@@ -537,7 +631,14 @@ class ElectrumServer:
             logger.warning(f"_current_header failed: {e}")
             return {"height": 0, "hex": ""}
 
-    def _get_history(self, scripthash: str) -> List[dict]:
+    def _get_history(self, *, scripthash: str = None, spk_hex: str = None) -> List[dict]:
+        address, spk_hex = self._resolve_query(scripthash=scripthash, spk_hex=spk_hex)
+        if address is None and spk_hex is None:
+            logger.debug(f"No script known for query scripthash={scripthash} spk={spk_hex}")
+            return []
+        return self._get_history_for_script(address, spk_hex)
+
+    def _get_history_for_script(self, address: Optional[str], spk_hex: Optional[str]) -> List[dict]:
         """
         Return tx history for a `scripthash`, combining several Bitcoin Core
         RPCs because no single one is sufficient for a watch-only descriptor
@@ -553,37 +654,27 @@ class ElectrumServer:
         on testnet; for mainnet under load we should maintain an incremental
         per-address tx index updated on each new block / mempool poll.
         """
-        address = self._scripthash_to_address(scripthash)
-        if address is None:
-            logger.debug(f"No address known for scripthash {scripthash}")
-            return []
-
         seen: Dict[str, int] = {}  # txid -> height (0 = mempool)
 
-        # 1. UTXOs currently sitting at this address.
         try:
-            for u in self.rpc.listunspent(0, 9999999, [address]):
+            for u in self._utxos_for_script(address, spk_hex, 0, 9999999):
                 seen.setdefault(u["txid"],
                                 self._height_from_confs(u.get("confirmations", 0)))
         except RPCError as e:
-            logger.debug(f"listunspent for {address} failed: {e}")
+            logger.debug(f"listunspent failed: {e}")
 
-        # 2. Confirmed wallet activity since genesis.
-        # listsinceblock("", 1, include_watchonly=True, include_removed=True)
-        try:
-            result = self.rpc.call(
-                "listsinceblock", "", 1, True, True)
-            for tx in (result.get("transactions", [])
-                       + result.get("removed", [])):
-                if tx.get("address") == address:
-                    seen.setdefault(
-                        tx["txid"],
-                        self._height_from_confs(tx.get("confirmations", 0)))
-        except RPCError as e:
-            logger.debug(f"listsinceblock failed: {e}")
+        if address:
+            try:
+                result = self.rpc.call("listsinceblock", "", 1, True, True)
+                for tx in (result.get("transactions", [])
+                           + result.get("removed", [])):
+                    if tx.get("address") == address:
+                        seen.setdefault(
+                            tx["txid"],
+                            self._height_from_confs(tx.get("confirmations", 0)))
+            except RPCError as e:
+                logger.debug(f"listsinceblock failed: {e}")
 
-        # 3. Mempool walk: covers watch-only "internal" sends that
-        # listtransactions/listsinceblock leave out of their details.
         try:
             mempool = self.rpc.call("getrawmempool")
         except RPCError:
@@ -591,7 +682,7 @@ class ElectrumServer:
         for txid in mempool:
             if txid in seen:
                 continue
-            if self._tx_touches_address(txid, address):
+            if self._tx_touches_script(txid, address, spk_hex):
                 seen[txid] = 0
 
         # Electrum protocol requires:
@@ -656,6 +747,83 @@ class ElectrumServer:
                 return 0
         return tip - confs + 1
 
+    def _get_balance(self, *, scripthash: str = None, spk_hex: str = None) -> dict:
+        address, spk_hex = self._resolve_query(scripthash=scripthash, spk_hex=spk_hex)
+        if address is None and spk_hex is None:
+            return {"confirmed": 0, "unconfirmed": 0}
+
+        confirmed_utxos = self._utxos_for_script(address, spk_hex, 1, 9999999)
+        confirmed = sum(int(round(u["amount"] * 1e8)) for u in confirmed_utxos)
+
+        unconfirmed_utxos = self._utxos_for_script(address, spk_hex, 0, 0)
+        unconfirmed = sum(int(round(u["amount"] * 1e8)) for u in unconfirmed_utxos)
+
+        return {"confirmed": confirmed, "unconfirmed": unconfirmed}
+
+    def _listunspent(self, *, scripthash: str = None, spk_hex: str = None) -> List[dict]:
+        address, spk_hex = self._resolve_query(scripthash=scripthash, spk_hex=spk_hex)
+        if address is None and spk_hex is None:
+            return []
+        result = []
+        for utxo in self._utxos_for_script(address, spk_hex, 0, 9999999):
+            result.append({
+                "tx_hash": utxo["txid"],
+                "tx_pos": utxo["vout"],
+                "height": utxo.get("confirmations", 0),
+                "value": int(round(utxo["amount"] * 1e8)),
+            })
+        return result
+
+    def _utxos_for_script(self, address: Optional[str], spk_hex: Optional[str],
+                          minconf: int, maxconf: int) -> List[dict]:
+        if address:
+            return self.rpc.listunspent(minconf, maxconf, [address])
+        if not spk_hex:
+            return []
+        utxos = self.rpc.listunspent(minconf, maxconf)
+        return [u for u in utxos if self._utxo_matches_spk(u, spk_hex)]
+
+    def _utxo_matches_spk(self, utxo: dict, spk_hex: str) -> bool:
+        spk_hex = spk_hex.lower()
+        addr = utxo.get("address")
+        if addr and address_to_scripthash(addr) == scriptpubkey_to_scripthash(spk_hex):
+            return True
+        try:
+            tx = self.rpc.getrawtransaction(utxo["txid"], True)
+            vout = tx["vout"][utxo["vout"]]
+            script = vout.get("scriptPubKey", {}).get("hex", "")
+            return script.lower() == spk_hex
+        except (RPCError, KeyError, IndexError):
+            return False
+
+    def _tx_touches_script(self, txid: str, address: Optional[str],
+                           spk_hex: Optional[str]) -> bool:
+        if address and self._tx_touches_address(txid, address):
+            return True
+        if not spk_hex:
+            return False
+        spk_hex = spk_hex.lower()
+        try:
+            tx = self.rpc.getrawtransaction(txid, True)
+        except RPCError:
+            return False
+        for vout in tx.get("vout", []):
+            if vout.get("scriptPubKey", {}).get("hex", "").lower() == spk_hex:
+                return True
+        for vin in tx.get("vin", []):
+            prev_txid = vin.get("txid")
+            prev_n = vin.get("vout")
+            if prev_txid is None or prev_n is None:
+                continue
+            try:
+                prev = self.rpc.getrawtransaction(prev_txid, True)
+                prev_out = prev["vout"][prev_n]
+            except (RPCError, KeyError, IndexError):
+                continue
+            if prev_out.get("scriptPubKey", {}).get("hex", "").lower() == spk_hex:
+                return True
+        return False
+
     def _tx_touches_address(self, txid: str, address: str) -> bool:
         """True if `address` appears in any output or in any spent prevout
         of `txid`. Used for the mempool fallback in _get_history."""
@@ -692,18 +860,46 @@ class ElectrumServer:
         addrs = spk.get("addresses") or []
         return addrs[0] if addrs else None
 
-    def _scripthash_status(self, scripthash: str) -> Optional[str]:
-        """
-        Compute the Electrum 'status' string for a scripthash:
-        SHA256 of the history string, or None if history is empty.
-        """
-        history = self._get_history(scripthash)
+    def _history_status(self, history: List[dict]) -> Optional[str]:
         if not history:
             return None
         history_str = "".join(
             f"{item['tx_hash']}:{item['height']}:" for item in history
         )
         return hashlib.sha256(history_str.encode()).hexdigest()
+
+    def _scripthash_status(self, scripthash: str) -> Optional[str]:
+        return self._history_status(self._get_history(scripthash=scripthash))
+
+    def _spk_status(self, spk_hex: str) -> Optional[str]:
+        return self._history_status(self._get_history(spk_hex=spk_hex))
+
+    def _outpoint_status(self, txid: str, vout: int) -> dict:
+        try:
+            txout = self.rpc.call("gettxout", txid, vout, True)
+        except RPCError:
+            txout = None
+        if txout:
+            confs = txout.get("confirmations", 0)
+            height = self._height_from_confs(confs) if confs else 0
+            return {"height": height}
+
+        try:
+            results = self.rpc.call(
+                "gettxspendingprevout", [{"txid": txid, "vout": vout}])
+        except RPCError:
+            results = None
+        if results and results[0]:
+            spender = results[0].get("spendingtxid")
+            if spender:
+                try:
+                    spender_tx = self.rpc.getrawtransaction(spender, True)
+                    confs = spender_tx.get("confirmations", 0)
+                    spender_height = self._height_from_confs(confs) if confs else 0
+                except RPCError:
+                    spender_height = 0
+                return {"spender_txhash": spender, "spender_height": spender_height}
+        return {}
 
     def _scripthash_to_address(self, scripthash: str) -> Optional[str]:
         """
@@ -716,6 +912,7 @@ class ElectrumServer:
         """Register an address so we can look it up by scripthash."""
         sh = address_to_scripthash(address)
         self._scripthash_cache[sh] = address
+        self._script_watcher.register_address(address)
 
     # ------------------------------------------------------------------
     # Notification loop — polls for new blocks and pushes to subscribers
@@ -723,16 +920,18 @@ class ElectrumServer:
 
     def _notification_loop(self):
         """
-        Poll Bitcoin Core every ~10 seconds. If a new block arrived,
-        send blockchain.headers.subscribe notifications to subscribed clients.
+        Poll Bitcoin Core every ~10 seconds. On new blocks, push header
+        notifications and refresh script subscription statuses.
         """
         while not self._stop_event.is_set():
             try:
                 height = self.rpc.getblockcount()
                 with self._tip_lock:
-                    if height != self._tip_height:
+                    new_block = height != self._tip_height
+                    if new_block:
                         self._tip_height = height
                         self._push_header_notification(height)
+                self._push_script_notifications()
             except Exception as e:
                 logger.debug(f"Notification loop error: {e}")
             self._stop_event.wait(timeout=10)
@@ -760,3 +959,45 @@ class ElectrumServer:
                         pass
         except Exception as e:
             logger.warning(f"Failed to push header notification: {e}")
+
+    def _push_script_notifications(self):
+        with self._clients_lock:
+            clients = list(self._clients.values())
+
+        watched_sh: set = set()
+        for _conn, state in clients:
+            watched_sh.update(state.scripthash_subs)
+            for spk in state.scriptpubkey_subs:
+                watched_sh.add(scriptpubkey_to_scripthash(bytes.fromhex(spk)))
+
+        for sh in watched_sh:
+            status = self._history_status(self._get_history(scripthash=sh))
+            if self._status_cache.get(sh) == status:
+                continue
+            self._status_cache[sh] = status
+
+            sh_notif = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "blockchain.scripthash.subscribe",
+                "params": [sh, status],
+            }).encode() + b"\n"
+            spk_notif = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "blockchain.scriptpubkey.subscribe",
+                "params": [sh, status],
+            }).encode() + b"\n"
+
+            for conn, state in clients:
+                if sh in state.scripthash_subs:
+                    try:
+                        with state.write_lock:
+                            conn.sendall(sh_notif)
+                    except OSError:
+                        pass
+                if any(scriptpubkey_to_scripthash(bytes.fromhex(spk)) == sh
+                       for spk in state.scriptpubkey_subs):
+                    try:
+                        with state.write_lock:
+                            conn.sendall(spk_notif)
+                    except OSError:
+                        pass

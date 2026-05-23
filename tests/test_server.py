@@ -15,7 +15,10 @@ for _mod in ("electrum", "electrum.bip32", "electrum.bitcoin"):
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from eps.rpc import BitcoinRPC, RPCError
-from eps.server import ElectrumServer, _merkle_branch
+from eps.server import (
+    ElectrumServer, ClientState, _merkle_branch, _negotiate_protocol,
+    PROTOCOL_VERSION_MIN, PROTOCOL_VERSION_MAX,
+)
 
 
 def _make_server() -> ElectrumServer:
@@ -30,7 +33,8 @@ class TestScripthashCache(unittest.TestCase):
         s1 = _make_server()
         s2 = _make_server()
         # Patch address_to_scripthash to return a known value
-        with patch("eps.server.address_to_scripthash", return_value="aabb"):
+        with patch("eps.server.address_to_scripthash", return_value="aabb"), \
+             patch("eps.addresses.ScriptWatcher.register_address"):
             s1.register_address("bc1qfoo")
         self.assertIn("aabb", s1._scripthash_cache)
         self.assertNotIn("aabb", s2._scripthash_cache)
@@ -54,6 +58,28 @@ class TestDispatch(unittest.TestCase):
         resp = self._dispatch("server.ping")
         self.assertIn("result", resp)
         self.assertIsNone(resp["result"])
+
+    def test_server_ping_17(self):
+        state = ClientState()
+        state.protocol_version = "1.7"
+        t = threading.current_thread()
+        self.server._clients[t] = (MagicMock(), state)
+        try:
+            resp = self._dispatch("server.ping", [32, "aa"])
+            self.assertEqual(resp["result"], {"data": "0" * 32})
+        finally:
+            self.server._clients.pop(t, None)
+
+    def test_server_features_protocol_range(self):
+        self.server.rpc.getblockhash.return_value = "00" * 32
+        resp = self._dispatch("server.features")
+        self.assertEqual(resp["result"]["protocol_min"], PROTOCOL_VERSION_MIN)
+        self.assertEqual(resp["result"]["protocol_max"], PROTOCOL_VERSION_MAX)
+
+    def test_protocol_negotiation(self):
+        self.assertEqual(_negotiate_protocol(["1.7", "1.7"]), "1.7")
+        self.assertEqual(_negotiate_protocol(["1.4", "1.6"]), "1.6")
+        self.assertEqual(_negotiate_protocol("1.4"), "1.4")
 
     def test_server_version(self):
         resp = self._dispatch("server.version", ["Electrum/4.0", "1.4"])
@@ -89,7 +115,8 @@ class TestGetBalance(unittest.TestCase):
 
     def setUp(self):
         self.server = _make_server()
-        with patch("eps.server.address_to_scripthash", return_value="testhash"):
+        with patch("eps.server.address_to_scripthash", return_value="testhash"), \
+             patch("eps.addresses.ScriptWatcher.register_address"):
             self.server.register_address("bc1qtest")
 
     def test_balance_sums_utxos(self):
@@ -145,6 +172,84 @@ class TestGetMerkle(unittest.TestCase):
             "peer"
         )
         self.assertIn("error", resp)
+
+
+class TestScriptPubKey(unittest.TestCase):
+
+    def setUp(self):
+        self.server = _make_server()
+        self.spk = "76a914" + "11" * 20 + "88ac"
+        self.sh = "abc123"
+
+    def test_scriptpubkey_subscribe_imports_and_subscribes(self):
+        self.server._script_watcher.ensure_watched = MagicMock()
+        self.server._spk_status = MagicMock(return_value="deadbeef")
+        resp = self.server._dispatch(
+            {"id": 1, "method": "blockchain.scriptpubkey.subscribe",
+             "params": [self.spk]},
+            "peer",
+        )
+        self.server._script_watcher.ensure_watched.assert_called_once_with(self.spk)
+        self.assertEqual(resp["result"], "deadbeef")
+
+    def test_scriptpubkey_get_balance(self):
+        self.server._script_watcher.ensure_watched = MagicMock()
+        with patch.object(self.server, "_get_balance", return_value={"confirmed": 1, "unconfirmed": 0}) as mock_bal:
+            resp = self.server._dispatch(
+                {"id": 1, "method": "blockchain.scriptpubkey.get_balance",
+                 "params": [self.spk]},
+                "peer",
+            )
+        mock_bal.assert_called_once_with(spk_hex=self.spk)
+        self.assertEqual(resp["result"]["confirmed"], 1)
+
+
+class TestBlockHeaders(unittest.TestCase):
+
+    def setUp(self):
+        self.server = _make_server()
+
+    def test_block_headers_17_format(self):
+        state = ClientState()
+        state.protocol_version = "1.7"
+        t = threading.current_thread()
+        self.server._clients[t] = (MagicMock(), state)
+        self.server.rpc.getblockcount.return_value = 100
+        self.server.rpc.getblockhash.return_value = "blockhash"
+        self.server.rpc.getblock.return_value = "aa" * 100
+        try:
+            resp = self.server._dispatch(
+                {"id": 1, "method": "blockchain.block.headers", "params": [90, 3]},
+                "peer",
+            )
+        finally:
+            self.server._clients.pop(t, None)
+        result = resp["result"]
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(result["max"], 2016)
+        self.assertEqual(len(result["headers"]), 3)
+        self.assertEqual(len(result["headers"][0]), 160)
+
+    def test_block_headers_14_format(self):
+        state = ClientState()
+        state.protocol_version = "1.4"
+        t = threading.current_thread()
+        self.server._clients[t] = (MagicMock(), state)
+        self.server.rpc.getblockcount.return_value = 100
+        self.server.rpc.getblockhash.return_value = "blockhash"
+        self.server.rpc.getblock.return_value = "bb" * 100
+        try:
+            resp = self.server._dispatch(
+                {"id": 1, "method": "blockchain.block.headers", "params": [0, 2]},
+                "peer",
+            )
+        finally:
+            self.server._clients.pop(t, None)
+        result = resp["result"]
+        self.assertIn("hex", result)
+        self.assertNotIn("headers", result)
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["max"], 2016)
 
 
 if __name__ == "__main__":

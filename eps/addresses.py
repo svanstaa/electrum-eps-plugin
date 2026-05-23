@@ -4,7 +4,8 @@
 # their import into Bitcoin Core via descriptors or importmulti.
 
 import hashlib
-from typing import Iterator, List, Tuple, Optional, TYPE_CHECKING
+import threading
+from typing import Dict, Iterator, List, Tuple, Optional, TYPE_CHECKING
 
 from electrum.bip32 import BIP32Node
 from electrum import bitcoin
@@ -92,17 +93,159 @@ def derive_addresses(ks, change: int, count: int) -> List[str]:
     return addresses
 
 
+def scriptpubkey_to_scripthash(script: bytes) -> str:
+    """Electrum scripthash from raw scriptPubKey bytes (reverse SHA256)."""
+    if isinstance(script, str):
+        script = bytes.fromhex(script)
+    digest = hashlib.sha256(script).digest()
+    return digest[::-1].hex()
+
+
 def address_to_scripthash(address: str) -> str:
     """
     Convert a Bitcoin address to the reversed SHA256 scripthash format
     used by the Electrum protocol.
     """
     script = bitcoin.address_to_script(address)
-    # Newer Electrum returns bytes; older versions returned a hex string.
     if isinstance(script, str):
         script = bytes.fromhex(script)
-    digest = hashlib.sha256(script).digest()
-    return digest[::-1].hex()
+    return scriptpubkey_to_scripthash(script)
+
+
+def _descriptor_checksum(desc: str) -> str:
+    INPUT_CHARSET = (
+        "0123456789()[],'/*abcdefgh@:$%{}"
+        "IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~"
+        "ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
+    )
+    CHECKSUM_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+    def _poly_mod(c, val):
+        c0 = c >> 35
+        c = ((c & 0x7FFFFFFFF) << 5) ^ val
+        if c0 & 1:
+            c ^= 0xF5DEE51989
+        if c0 & 2:
+            c ^= 0xA9FDCA3312
+        if c0 & 4:
+            c ^= 0x1BAB10E32D
+        if c0 & 8:
+            c ^= 0x3706B1677A
+        if c0 & 16:
+            c ^= 0x644D626FFD
+        return c
+
+    c = 1
+    cls = 0
+    cls_count = 0
+    for ch in desc:
+        pos = INPUT_CHARSET.find(ch)
+        if pos < 0:
+            return desc
+        c = _poly_mod(c, pos & 31)
+        cls = cls * 3 + (pos >> 5)
+        cls_count += 1
+        if cls_count == 3:
+            c = _poly_mod(c, cls)
+            cls = 0
+            cls_count = 0
+    if cls_count:
+        c = _poly_mod(c, cls)
+    for _ in range(8):
+        c = _poly_mod(c, 0)
+    c ^= 1
+
+    checksum = ""
+    for i in range(8):
+        checksum = CHECKSUM_CHARSET[(c >> (5 * i)) & 31] + checksum
+    return f"{desc}#{checksum}"
+
+
+def add_descriptor_checksum(desc: str) -> str:
+    """Append Bitcoin Core descriptor checksum (#...) to `desc`."""
+    return _descriptor_checksum(desc)
+
+
+class ScriptWatcher:
+    """
+    Track output scripts in Bitcoin Core. Used for Electrum protocol 1.7
+    on-demand `blockchain.scriptpubkey.*` subscriptions.
+    """
+
+    def __init__(self, rpc: BitcoinRPC):
+        self.rpc = rpc
+        self._lock = threading.Lock()
+        self._imported_spks: set = set()
+        self._spk_to_address: Dict[str, Optional[str]] = {}
+        self._sh_to_spk: Dict[str, str] = {}
+
+    def register_address(self, address: str) -> None:
+        script = bitcoin.address_to_script(address)
+        if isinstance(script, str):
+            script = bytes.fromhex(script)
+        spk_hex = script.hex()
+        sh = scriptpubkey_to_scripthash(script)
+        with self._lock:
+            self._spk_to_address[spk_hex] = address
+            self._sh_to_spk[sh] = spk_hex
+
+    def address_for_spk(self, spk_hex: str) -> Optional[str]:
+        with self._lock:
+            return self._spk_to_address.get(spk_hex.lower().strip())
+
+    def ensure_watched(self, spk_hex: str) -> None:
+        spk_hex = spk_hex.lower().strip()
+        with self._lock:
+            if spk_hex in self._imported_spks:
+                return
+
+        script = bytes.fromhex(spk_hex)
+        address = self.address_for_spk(spk_hex)
+        if address is None:
+            try:
+                address = bitcoin.script_to_address(script)
+            except Exception:
+                address = None
+
+        if address:
+            desc = add_descriptor_checksum(f"addr({address})")
+        else:
+            desc = add_descriptor_checksum(f"raw({spk_hex})")
+
+        request = [{
+            "desc": desc,
+            "timestamp": "now",
+            "watchonly": True,
+            "keypool": False,
+        }]
+        results = self.rpc.importdescriptors(request)
+        for r in results:
+            if not r.get("success"):
+                err = r.get("error", {})
+                if err.get("code") == -4:
+                    break
+                raise RPCError(err.get("code", -1), err.get("message", "unknown"))
+
+        sh = scriptpubkey_to_scripthash(script)
+        with self._lock:
+            self._imported_spks.add(spk_hex)
+            self._spk_to_address.setdefault(spk_hex, address)
+            self._sh_to_spk[sh] = spk_hex
+
+    def address_for_scripthash(self, scripthash: str) -> Optional[str]:
+        spk_hex = self._sh_to_spk.get(scripthash)
+        if spk_hex is None:
+            return None
+        return self._spk_to_address.get(spk_hex)
+
+    def script_for_scripthash(self, scripthash: str) -> Optional[bytes]:
+        spk_hex = self._sh_to_spk.get(scripthash)
+        if spk_hex is None:
+            return None
+        return bytes.fromhex(spk_hex)
+
+    def script_for_spk(self, spk_hex: str) -> bytes:
+        return bytes.fromhex(spk_hex.lower().strip())
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +344,7 @@ class AddressImporter:
             desc = f"{tmpl}({xpub}/{change}/*)"
 
         # Bitcoin Core requires a checksum
-        desc_with_checksum = self._add_descriptor_checksum(desc)
+        desc_with_checksum = add_descriptor_checksum(desc)
 
         request = [{
             "desc": desc_with_checksum,
@@ -263,45 +406,4 @@ class AddressImporter:
 
     @staticmethod
     def _add_descriptor_checksum(desc: str) -> str:
-        INPUT_CHARSET = (
-            "0123456789()[],'/*abcdefgh@:$%{}"
-            "IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~"
-            "ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
-        )
-        CHECKSUM_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-
-        def _poly_mod(c, val):
-            c0 = c >> 35
-            c = ((c & 0x7FFFFFFFF) << 5) ^ val
-            if c0 & 1: c ^= 0xF5DEE51989
-            if c0 & 2: c ^= 0xA9FDCA3312
-            if c0 & 4: c ^= 0x1BAB10E32D
-            if c0 & 8: c ^= 0x3706B1677A
-            if c0 & 16: c ^= 0x644D626FFD
-            return c
-
-        c = 1
-        cls = 0
-        cls_count = 0
-        for ch in desc:
-            pos = INPUT_CHARSET.find(ch)
-            if pos < 0:
-                return desc  # invalid character — return without checksum
-            c = _poly_mod(c, pos & 31)
-            cls = cls * 3 + (pos >> 5)
-            cls_count += 1
-            if cls_count == 3:
-                c = _poly_mod(c, cls)
-                cls = 0
-                cls_count = 0
-        if cls_count:
-            c = _poly_mod(c, cls)
-        for _ in range(8):
-            c = _poly_mod(c, 0)
-        c ^= 1
-
-        checksum = ""
-        for i in range(8):
-            checksum = CHECKSUM_CHARSET[(c >> (5 * i)) & 31] + checksum
-
-        return f"{desc}#{checksum}"
+        return _descriptor_checksum(desc)
