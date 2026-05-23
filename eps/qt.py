@@ -10,9 +10,9 @@ from xml.sax.saxutils import escape
 
 try:
     from PyQt6.QtWidgets import (
-        QCheckBox, QFormLayout, QHBoxLayout, QLabel,
+        QFormLayout, QLabel,
         QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
-        QTextEdit, QVBoxLayout, QWidget,
+        QTextEdit, QVBoxLayout,
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
     from PyQt6.QtGui import QTextOption
@@ -22,9 +22,9 @@ try:
     _WRAP_ANYWHERE = QTextOption.WrapMode.WrapAnywhere
 except ImportError:
     from PyQt5.QtWidgets import (
-        QCheckBox, QFormLayout, QHBoxLayout, QLabel,
+        QFormLayout, QLabel,
         QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
-        QTextEdit, QVBoxLayout, QWidget,
+        QTextEdit, QVBoxLayout,
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
     from PyQt5.QtGui import QTextOption
@@ -117,12 +117,6 @@ def input_field(value=None, width: int = 400) -> QLineEdit:
     return edit
 
 
-def checkbox(text: str, selected: bool = False) -> QCheckBox:
-    cb = QCheckBox(text)
-    cb.setChecked(selected)
-    return cb
-
-
 def append_log(log_t: QTextEdit, level: str, pkg: str, msg: str) -> None:
     scrollbar = log_t.verticalScrollBar()
     was_on_bottom = scrollbar.value() >= scrollbar.maximum() - 5
@@ -205,9 +199,6 @@ class Plugin(BasePlugin):
         self._status_bridge.status_changed.connect(self._apply_status_in_gui_thread)
         self._status_bridge.log_line.connect(self._apply_log_in_gui_thread)
 
-        if self.config.get("eps_autostart", False):
-            self._start_server_if_configured()
-
     # ------------------------------------------------------------------
     # Plugin settings entry (Tools → Plugins → Settings)
     # ------------------------------------------------------------------
@@ -232,11 +223,17 @@ class Plugin(BasePlugin):
     def load_wallet(self, wallet: "Abstract_Wallet", window: "ElectrumWindow"):
         self._active_window = window
         self._active_wallet = wallet
-        if self._server:
-            self._register_wallet_addresses(wallet)
-            self._bookmark_eps_server(add=True)
-            if self._prev_network_settings is not None:
-                self._auto_configure_network()
+        if not self._server_running:
+            if not self.config.get("eps_rpc_user"):
+                logger.info("EPS: wallet opened but RPC not configured")
+                return
+            if not self.start_server():
+                return
+            return
+        self._register_wallet_addresses(wallet)
+        self._bookmark_eps_server(add=True)
+        if self._prev_network_settings is not None:
+            self._auto_configure_network()
 
     @hook
     def close_wallet(self, wallet: "Abstract_Wallet"):
@@ -255,12 +252,6 @@ class Plugin(BasePlugin):
             password=self.config.get("eps_rpc_pass", ""),
             wallet=self.config.get("eps_rpc_wallet", ""),
         )
-
-    def _start_server_if_configured(self):
-        if not self.config.get("eps_rpc_user"):
-            logger.info("EPS: not starting — RPC credentials not configured")
-            return
-        self.start_server()
 
     def _tls_cert_paths(self) -> tuple:
         """Return (certfile, keyfile), auto-generating a self-signed cert if needed."""
@@ -535,12 +526,6 @@ class Plugin(BasePlugin):
             _('Addresses beyond the last used to import into Core on bulk import.'),
             False))
 
-        autostart_cb = checkbox(
-            _('Start server automatically when plugin is enabled'),
-            bool(self.config.get("eps_autostart", False)),
-        )
-        form.addRow('', autostart_cb)
-
         # --- Wallet import ---
         form.addRow(title(_('Wallet import')))
         import_btn = QPushButton(_('Import addresses from open wallet'))
@@ -556,15 +541,7 @@ class Plugin(BasePlugin):
             _("Running") if self._server_running else _("Not started"))
         self._status_label.setStyleSheet(
             "color: green;" if self._server_running else "color: grey;")
-        status_row = QHBoxLayout()
-        status_row.addWidget(self._status_label)
-        btn_start = QPushButton(_('Start'))
-        btn_stop = QPushButton(_('Stop'))
-        status_row.addWidget(btn_start)
-        status_row.addWidget(btn_stop)
-        status_w = QWidget()
-        status_w.setLayout(status_row)
-        form.addRow('', status_w)
+        form.addRow('', self._status_label)
 
         log_t = QTextEdit()
         log_t.setReadOnly(True)
@@ -587,7 +564,6 @@ class Plugin(BasePlugin):
             self.config.set_key("eps_listen_host", listen_host_e.text().strip())
             self.config.set_key("eps_listen_port", listen_port_e.value())
             self.config.set_key("eps_gap_limit", gap_e.value())
-            self.config.set_key("eps_autostart", autostart_cb.isChecked())
 
         def _can_connect() -> bool:
             user, password = _parse_rpc_auth(auth_e.text())
@@ -609,22 +585,10 @@ class Plugin(BasePlugin):
             else:
                 self._log("ERROR", "Failed to start EPS server")
 
-        def _start_from_form():
-            if not _can_connect():
-                QMessageBox.warning(
-                    d, "EPS",
-                    _("RPC Auth is required (username:password)."))
-                return
-            _apply_form_to_config()
-            log_t.show()
-            self.start_server()
-
         save_b = QPushButton(_('Save && Connect'))
         save_b.setDefault(True)
         save_b.clicked.connect(_save_and_connect)
 
-        btn_start.clicked.connect(_start_from_form)
-        btn_stop.clicked.connect(self.stop_server)
         import_btn.clicked.connect(
             lambda: self.import_wallet_addresses(self._active_window, d))
 
