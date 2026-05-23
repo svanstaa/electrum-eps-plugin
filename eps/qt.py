@@ -319,10 +319,30 @@ class Plugin(BasePlugin):
     def stop_server(self):
         self._bookmark_eps_server(add=False)
         if self._server:
+            self._server.on_client_connected = None
+            self._server.on_client_disconnected = None
             self._server.stop()
             self._server = None
         self._server_running = False
         self._set_status("Stopped")
+
+    def _emit_log(self, level: str, pkg: str, msg: str) -> None:
+        bridge = getattr(self, "_status_bridge", None)
+        if bridge is None:
+            return
+        try:
+            bridge.log_line.emit(level, pkg, msg)
+        except RuntimeError:
+            pass
+
+    def _emit_status(self, msg: str, error: bool) -> None:
+        bridge = getattr(self, "_status_bridge", None)
+        if bridge is None:
+            return
+        try:
+            bridge.status_changed.emit(msg, error)
+        except RuntimeError:
+            pass
 
     def _eps_server_addr(self):
         try:
@@ -413,18 +433,12 @@ class Plugin(BasePlugin):
 
     def _log(self, level: str, msg: str, *, pkg: str = "eps"):
         logger.log(getattr(logging, level, logging.INFO), msg)
-        try:
-            self._status_bridge.log_line.emit(level, pkg, msg)
-        except RuntimeError:
-            pass
+        self._emit_log(level, pkg, msg)
 
     def _set_status(self, msg: str, error: bool = False):
         level = "ERROR" if error else "INFO"
         self._log(level, msg)
-        try:
-            self._status_bridge.status_changed.emit(msg, error)
-        except RuntimeError:
-            pass
+        self._emit_status(msg, error)
 
     def _apply_status_in_gui_thread(self, msg: str, error: bool):
         label = self._status_label
