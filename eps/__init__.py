@@ -11,5 +11,6 @@
 #   eps_listen_port     – port to bind our Electrum server on (default: 50002)
 #   eps_gap_limit       – how many addresses beyond last used to import (default: 20)
 #   eps_autostart       – start server automatically when plugin is enabled (default: False)
-#   eps_cert_path       – path to TLS certificate file (PEM)
-#   eps_key_path        – path to TLS private key file (PEM)
+#
+# TLS: a self-signed certificate is auto-generated on first start and stored under
+# the Electrum data directory (see eps/tls.py); no user configuration required.

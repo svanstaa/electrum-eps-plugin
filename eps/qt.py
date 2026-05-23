@@ -10,7 +10,7 @@ from xml.sax.saxutils import escape
 
 try:
     from PyQt6.QtWidgets import (
-        QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+        QCheckBox, QFormLayout, QHBoxLayout, QLabel,
         QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
         QTextEdit, QVBoxLayout, QWidget,
     )
@@ -22,7 +22,7 @@ try:
     _WRAP_ANYWHERE = QTextOption.WrapMode.WrapAnywhere
 except ImportError:
     from PyQt5.QtWidgets import (
-        QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+        QCheckBox, QFormLayout, QHBoxLayout, QLabel,
         QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
         QTextEdit, QVBoxLayout, QWidget,
     )
@@ -262,6 +262,15 @@ class Plugin(BasePlugin):
             return
         self.start_server()
 
+    def _tls_cert_paths(self) -> tuple:
+        """Return (certfile, keyfile), auto-generating a self-signed cert if needed."""
+        from .tls import default_cert_paths, generate_self_signed_cert
+        cert_path, key_path = default_cert_paths()
+        if not generate_self_signed_cert(cert_path, key_path):
+            self._set_status("TLS cert generation failed — running without TLS", error=True)
+            return "", ""
+        return cert_path, key_path
+
     def start_server(self) -> bool:
         if self._server_running:
             return True
@@ -277,14 +286,7 @@ class Plugin(BasePlugin):
             self._set_status(f"Cannot connect to Bitcoin Core: {e}", error=True)
             return False
 
-        cert_path = self.config.get("eps_cert_path", "")
-        key_path = self.config.get("eps_key_path", "")
-        if not cert_path or not key_path:
-            from .tls import default_cert_paths, generate_self_signed_cert
-            cert_path, key_path = default_cert_paths()
-            if not generate_self_signed_cert(cert_path, key_path):
-                self._set_status("TLS cert generation failed — running without TLS", error=True)
-                cert_path = key_path = ""
+        cert_path, key_path = self._tls_cert_paths()
 
         from .server import ElectrumServer
         self._server = ElectrumServer(
@@ -539,31 +541,6 @@ class Plugin(BasePlugin):
         )
         form.addRow('', autostart_cb)
 
-        # --- TLS ---
-        form.addRow(title(_('TLS certificate')))
-
-        from .tls import default_cert_paths
-        default_cert, default_key = default_cert_paths()
-
-        cert_e = input_field(self.config.get("eps_cert_path", default_cert))
-        cert_btn = QPushButton('…')
-        cert_btn.setMaximumWidth(30)
-        cert_row = QHBoxLayout()
-        cert_row.addWidget(cert_e)
-        cert_row.addWidget(cert_btn)
-        form.addRow(_('Certificate:'), cert_row)
-
-        key_e = input_field(self.config.get("eps_key_path", default_key))
-        key_btn = QPushButton('…')
-        key_btn.setMaximumWidth(30)
-        key_row = QHBoxLayout()
-        key_row.addWidget(key_e)
-        key_row.addWidget(key_btn)
-        form.addRow(_('Key:'), key_row)
-
-        gen_cert_btn = QPushButton(_('Generate self-signed certificate'))
-        form.addRow('', gen_cert_btn)
-
         # --- Wallet import ---
         form.addRow(title(_('Wallet import')))
         import_btn = QPushButton(_('Import addresses from open wallet'))
@@ -598,32 +575,6 @@ class Plugin(BasePlugin):
         form.addRow(log_t)
         self._log_widget = log_t
 
-        def _pick_file(edit, caption):
-            path, _ = QFileDialog.getOpenFileName(
-                d, caption, "",
-                "PEM files (*.pem *.crt *.key);;All (*)")
-            if path:
-                edit.setText(path)
-
-        cert_btn.clicked.connect(lambda: _pick_file(cert_e, _('Select certificate')))
-        key_btn.clicked.connect(lambda: _pick_file(key_e, _('Select key')))
-
-        def _generate_cert():
-            from .tls import generate_self_signed_cert
-            cert = cert_e.text() or default_cert
-            key = key_e.text() or default_key
-            if generate_self_signed_cert(cert, key):
-                cert_e.setText(cert)
-                key_e.setText(key)
-                QMessageBox.information(d, "EPS", f"Certificate generated:\n{cert}")
-            else:
-                QMessageBox.critical(
-                    d, "EPS",
-                    "Failed to generate certificate.\n"
-                    "Ensure `openssl` is on PATH or install the `cryptography` package.")
-
-        gen_cert_btn.clicked.connect(_generate_cert)
-
         def _apply_form_to_config():
             host, port = _parse_rpc_url(url_e.text())
             user, password = _parse_rpc_auth(auth_e.text())
@@ -637,8 +588,6 @@ class Plugin(BasePlugin):
             self.config.set_key("eps_listen_port", listen_port_e.value())
             self.config.set_key("eps_gap_limit", gap_e.value())
             self.config.set_key("eps_autostart", autostart_cb.isChecked())
-            self.config.set_key("eps_cert_path", cert_e.text().strip())
-            self.config.set_key("eps_key_path", key_e.text().strip())
 
         def _can_connect() -> bool:
             user, password = _parse_rpc_auth(auth_e.text())
