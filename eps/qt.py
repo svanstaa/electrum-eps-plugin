@@ -3,34 +3,40 @@
 # Electrum plugin entry point for the Qt GUI.
 # Manages the server lifecycle, settings UI, and wallet hooks.
 
-import threading
 import logging
 from typing import Optional, TYPE_CHECKING
+from urllib.parse import urlparse
+from xml.sax.saxutils import escape
 
-# Electrum 4.5+ uses PyQt6; older versions use PyQt5.
 try:
     from PyQt6.QtWidgets import (
-        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-        QPushButton, QCheckBox, QSpinBox, QGroupBox,
-        QProgressDialog, QMessageBox, QFileDialog,
+        QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+        QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
+        QTextEdit, QVBoxLayout, QWidget,
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-    from PyQt6.QtGui import QFont
+    from PyQt6.QtGui import QTextOption
     _ECHO_PASSWORD = QLineEdit.EchoMode.Password
-    _WINDOW_MODAL  = Qt.WindowModality.WindowModal
+    _WINDOW_MODAL = Qt.WindowModality.WindowModal
+    _ALIGN_RIGHT_VCENTER = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+    _WRAP_ANYWHERE = QTextOption.WrapMode.WrapAnywhere
 except ImportError:
     from PyQt5.QtWidgets import (
-        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-        QPushButton, QCheckBox, QSpinBox, QGroupBox,
-        QProgressDialog, QMessageBox, QFileDialog,
+        QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+        QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
+        QTextEdit, QVBoxLayout, QWidget,
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
-    from PyQt5.QtGui import QFont
+    from PyQt5.QtGui import QTextOption
     _ECHO_PASSWORD = QLineEdit.Password
-    _WINDOW_MODAL  = Qt.WindowModal
+    _WINDOW_MODAL = Qt.WindowModal
+    _ALIGN_RIGHT_VCENTER = Qt.AlignRight | Qt.AlignVCenter
+    _WRAP_ANYWHERE = QTextOption.WrapAnywhere
 
-from electrum.plugin import BasePlugin, hook
+from electrum import constants
+from electrum.gui.qt.util import Buttons, CloseButton, WindowModalDialog
 from electrum.i18n import _
+from electrum.plugin import BasePlugin, hook
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
@@ -38,18 +44,105 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("eps.plugin")
 
+_LOG_COLORS = {
+    'ERROR': '#CD0200',
+    'WARN': '#D47500',
+    'INFO': '#4BBF73',
+    'DEBUG': '#2780E3',
+}
+
+
+def default_rpc_port() -> int:
+    return {
+        'mainnet': 8332,
+        'testnet': 18332,
+        'testnet4': 48332,
+        'regtest': 18443,
+        'signet': 38332,
+    }.get(constants.net.NET_NAME, 8332)
+
+
+def default_rpc_url() -> str:
+    return f"http://127.0.0.1:{default_rpc_port()}/"
+
+
+def _compose_rpc_url(host: str, port) -> str:
+    return f"http://{host}:{port}/"
+
+
+def _parse_rpc_url(url: str) -> tuple:
+    url = (url or "").strip()
+    if not url:
+        return "127.0.0.1", default_rpc_port()
+    if "://" not in url:
+        url = "http://" + url
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or default_rpc_port()
+    return host, int(port)
+
+
+def _parse_rpc_auth(auth: str) -> tuple:
+    auth = (auth or "").strip()
+    if not auth:
+        return "", ""
+    user, _, password = auth.partition(":")
+    return user, password
+
+
+def _compose_rpc_auth(user: str, password: str) -> str:
+    if not user:
+        return ""
+    return f"{user}:{password}"
+
+
+def title(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setStyleSheet('QLabel { font-weight: bold }')
+    return label
+
+
+def helptext(text: str, wrap: bool = True) -> QLabel:
+    label = QLabel(text)
+    label.setWordWrap(wrap)
+    label.setStyleSheet('QLabel { color: #aaa; font-size: 0.9em }')
+    return label
+
+
+def input_field(value=None, width: int = 400) -> QLineEdit:
+    edit = QLineEdit()
+    if value is not None:
+        edit.setText(str(value))
+    edit.setMaximumWidth(width)
+    return edit
+
+
+def checkbox(text: str, selected: bool = False) -> QCheckBox:
+    cb = QCheckBox(text)
+    cb.setChecked(selected)
+    return cb
+
+
+def append_log(log_t: QTextEdit, level: str, pkg: str, msg: str) -> None:
+    scrollbar = log_t.verticalScrollBar()
+    was_on_bottom = scrollbar.value() >= scrollbar.maximum() - 5
+    color = _LOG_COLORS.get(level, 'auto')
+    log_t.append(
+        f'<p><span style="color:{color}">{escape(level)}</span> '
+        f'<strong>{escape(pkg)}</strong> » {escape(msg)}</p>'
+    )
+    log_t.show()
+    if was_on_bottom:
+        log_t.ensureCursorVisible()
+
 
 # ---------------------------------------------------------------------------
-# Thread-safe bridge for delivering status messages from background threads
-# (server-accept loop, per-client handlers, notifier) into the GUI thread.
-#
-# Qt widgets must only be touched from the thread that owns the QApplication
-# event loop. `pyqtSignal.emit()` is itself thread-safe, and the connected
-# slot is automatically queued onto the receiver's thread (the GUI thread).
+# Thread-safe bridge for GUI updates from background threads
 # ---------------------------------------------------------------------------
 
 class _StatusBridge(QObject):
-    status_changed = pyqtSignal(str, bool)  # (message, is_error)
+    status_changed = pyqtSignal(str, bool)   # (message, is_error)
+    log_line = pyqtSignal(str, str, str)     # (level, pkg, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +151,7 @@ class _StatusBridge(QObject):
 
 class ImportWorker(QObject):
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)  # (success, message)
+    finished = pyqtSignal(bool, str)
 
     def __init__(self, rpc, wallet, gap_limit):
         super().__init__()
@@ -74,7 +167,7 @@ class ImportWorker(QObject):
             self.progress.emit(_("Importing addresses into Bitcoin Core…"))
             imported_new = importer.import_wallet(
                 self.wallet,
-                progress_cb=lambda msg: self.progress.emit(msg)
+                progress_cb=lambda msg: self.progress.emit(msg),
             )
 
             if imported_new:
@@ -102,46 +195,52 @@ class Plugin(BasePlugin):
         self._server = None
         self._server_running = False
         self._active_window: Optional["ElectrumWindow"] = None
+        self._active_wallet: Optional["Abstract_Wallet"] = None
         self._status_label: Optional[QLabel] = None
+        self._log_widget: Optional[QTextEdit] = None
+        self._prev_network_settings = None
+        self._eps_scheme = "s"
 
-        # Cross-thread bridge for status updates. Created here (in the GUI
-        # thread, since the plugin is constructed by Electrum's plugin system
-        # on the main thread) so that the slot connection is also routed via
-        # Qt::QueuedConnection when emit() comes from a non-GUI thread.
         self._status_bridge = _StatusBridge()
         self._status_bridge.status_changed.connect(self._apply_status_in_gui_thread)
+        self._status_bridge.log_line.connect(self._apply_log_in_gui_thread)
 
         if self.config.get("eps_autostart", False):
             self._start_server_if_configured()
+
+    # ------------------------------------------------------------------
+    # Plugin settings entry (Tools → Plugins → Settings)
+    # ------------------------------------------------------------------
+
+    def requires_settings(self):
+        return True
+
+    def settings_dialog(self, window):
+        """Opened from Tools → Plugins, or via Wallet → EPS Settings."""
+        self._open_settings_dialog(window)
 
     # ------------------------------------------------------------------
     # Hooks
     # ------------------------------------------------------------------
 
     @hook
-    def init_qt(self, gui):
-        """Called once when the Qt GUI is ready."""
-        self._gui = gui
-
-    @hook
     def init_menubar(self, window: "ElectrumWindow"):
-        """Add 'EPS Settings' entry to the Wallet menu."""
-        window.wallet_menu.addAction("EPS Settings", lambda: self._open_settings_dialog(window))
+        window.wallet_menu.addAction(
+            "EPS Settings", lambda: self.settings_dialog(window))
 
     @hook
     def load_wallet(self, wallet: "Abstract_Wallet", window: "ElectrumWindow"):
-        """Called each time a wallet is opened."""
         self._active_window = window
         self._active_wallet = wallet
         if self._server:
             self._register_wallet_addresses(wallet)
-            # If start_server() ran before any window existed (e.g. autostart),
-            # the bookmark op was deferred. Apply it now that we have a window.
             self._bookmark_eps_server(add=True)
+            if self._prev_network_settings is not None:
+                self._auto_configure_network()
 
     @hook
     def close_wallet(self, wallet: "Abstract_Wallet"):
-        pass  # server keeps running; user must stop it explicitly
+        pass
 
     # ------------------------------------------------------------------
     # Server lifecycle
@@ -151,7 +250,7 @@ class Plugin(BasePlugin):
         from .rpc import BitcoinRPC
         return BitcoinRPC(
             host=self.config.get("eps_rpc_host", "127.0.0.1"),
-            port=int(self.config.get("eps_rpc_port", 8332)),
+            port=int(self.config.get("eps_rpc_port", default_rpc_port())),
             user=self.config.get("eps_rpc_user", ""),
             password=self.config.get("eps_rpc_pass", ""),
             wallet=self.config.get("eps_rpc_wallet", ""),
@@ -184,7 +283,7 @@ class Plugin(BasePlugin):
             from .tls import default_cert_paths, generate_self_signed_cert
             cert_path, key_path = default_cert_paths()
             if not generate_self_signed_cert(cert_path, key_path):
-                self._set_status("TLS cert generation failed — running without TLS")
+                self._set_status("TLS cert generation failed — running without TLS", error=True)
                 cert_path = key_path = ""
 
         from .server import ElectrumServer
@@ -205,30 +304,19 @@ class Plugin(BasePlugin):
 
         listen_host = self.config.get("eps_listen_host", "127.0.0.1")
         listen_port = self.config.get("eps_listen_port", 50002)
-        scheme = "s" if (cert_path and key_path) else "t"
-        self._eps_scheme = scheme
+        self._eps_scheme = "s" if (cert_path and key_path) else "t"
 
-        # Make EPS discoverable in Electrum's Network preferences dialog
-        # by adding it to NETWORK_BOOKMARKED_SERVERS. The user then chooses
-        # to actually connect via the standard Network dialog. We never
-        # override `server`, `oneserver`, or `auto_connect` — those remain
-        # 100% the user's call.
         self._bookmark_eps_server(add=True)
+        self._auto_configure_network()
 
-        self._set_status(
-            f"Running on {listen_host}:{listen_port} "
-            f"(select it under Tools → Network)"
-        )
+        self._set_status(f"Running on {listen_host}:{listen_port}")
 
-        if hasattr(self, "_active_wallet") and self._active_wallet:
+        if self._active_wallet:
             self._register_wallet_addresses(self._active_wallet)
 
         return True
 
     def stop_server(self):
-        # Remove the bookmark BEFORE stopping the server so that if the user
-        # is currently connected through us, Electrum will fall back to its
-        # normal server selection instead of repeatedly trying a dead bookmark.
         self._bookmark_eps_server(add=False)
         if self._server:
             self._server.stop()
@@ -237,7 +325,6 @@ class Plugin(BasePlugin):
         self._set_status("Stopped")
 
     def _eps_server_addr(self):
-        """Build the ServerAddr describing our embedded server."""
         try:
             from electrum.interface import ServerAddr
         except ImportError:
@@ -252,20 +339,60 @@ class Plugin(BasePlugin):
             return None
 
     def _get_network(self):
-        """Return Electrum's Network object, or None if not yet available."""
         win = getattr(self, "_active_window", None)
         return getattr(win, "network", None) if win else None
 
+    def _prepare_network_override(self):
+        if self._prev_network_settings is not None:
+            return
+        self._prev_network_settings = {
+            setting: self.config.cmdline_options.get(setting)
+            for setting in ("oneserver", "server")
+        }
+        self.config.cmdline_options["oneserver"] = True
+        self.config.cmdline_options.setdefault("server", "127.0.0.1:1:t")
+
+    def _auto_configure_network(self):
+        try:
+            from electrum.network import Network
+        except ImportError:
+            return
+
+        network = Network.get_instance() or self._get_network()
+        server = self._eps_server_addr()
+        if network is None or server is None:
+            logger.debug("Network auto-config deferred (no network or server yet)")
+            return
+
+        self._prepare_network_override()
+        self.config.cmdline_options.pop("server", None)
+
+        try:
+            net_params = network.get_parameters()._replace(
+                server=server, oneserver=True)
+            network.run_from_another_thread(network.set_parameters(net_params))
+            self.config.cmdline_options["server"] = str(server)
+            self._log("INFO", f"Electrum network set to {server}")
+        except Exception as e:
+            logger.warning(f"Network auto-config failed: {e}")
+            self._log("WARN", f"Could not auto-configure network: {e}")
+
+    def _restore_network_settings(self):
+        if not self._prev_network_settings:
+            return
+        for setting, prev_value in self._prev_network_settings.items():
+            if prev_value is None:
+                self.config.cmdline_options.pop(setting, None)
+            else:
+                self.config.cmdline_options[setting] = prev_value
+        self._prev_network_settings = None
+
     def _bookmark_eps_server(self, *, add: bool) -> None:
-        """Add or remove the EPS server from NETWORK_BOOKMARKED_SERVERS."""
         network = self._get_network()
         server = self._eps_server_addr()
         if network is None or server is None:
-            # We may be called before a wallet/window has loaded.
-            # In that case the bookmark op is deferred until load_wallet fires.
             logger.debug(
-                f"Bookmark {'add' if add else 'remove'} deferred (no network yet)"
-            )
+                f"Bookmark {'add' if add else 'remove'} deferred (no network yet)")
             return
         try:
             network.set_server_bookmark(server, add=add)
@@ -284,26 +411,25 @@ class Plugin(BasePlugin):
             f"({len(addrs)} from {getattr(wallet, 'basename', lambda: '?')()})"
         )
 
+    def _log(self, level: str, msg: str, *, pkg: str = "eps"):
+        logger.log(getattr(logging, level, logging.INFO), msg)
+        try:
+            self._status_bridge.log_line.emit(level, pkg, msg)
+        except RuntimeError:
+            pass
+
     def _set_status(self, msg: str, error: bool = False):
-        """
-        Thread-safe: callable from any thread. Logs immediately and emits
-        a Qt signal whose slot will run on the GUI thread to touch the
-        QLabel widget.
-        """
-        logger.info(f"EPS status: {msg}")
+        level = "ERROR" if error else "INFO"
+        self._log(level, msg)
         try:
             self._status_bridge.status_changed.emit(msg, error)
         except RuntimeError:
-            # _status_bridge.deleteLater() happened (plugin unloaded) — drop.
             pass
 
     def _apply_status_in_gui_thread(self, msg: str, error: bool):
-        """Slot — always runs in the GUI thread thanks to QueuedConnection."""
         label = self._status_label
         if label is None:
             return
-        # Even on the GUI thread, the QLabel may have been destroyed in the
-        # interval between emit() and the slot dispatch (dialog closed).
         try:
             color = "red" if error else "green"
             label.setText(msg)
@@ -311,212 +437,294 @@ class Plugin(BasePlugin):
         except RuntimeError:
             self._status_label = None
 
-    # ------------------------------------------------------------------
-    # Settings dialog (opened from Wallet menu)
-    # ------------------------------------------------------------------
-
-    def _open_settings_dialog(self, window: "ElectrumWindow"):
+    def _apply_log_in_gui_thread(self, level: str, pkg: str, msg: str):
+        log_t = self._log_widget
+        if log_t is None:
+            return
         try:
-            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
-        except ImportError:
-            from PyQt5.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
+            append_log(log_t, level, pkg, msg)
+        except RuntimeError:
+            self._log_widget = None
 
-        dlg = QDialog(window)
-        dlg.setWindowTitle("Electrum Personal Server")
-        dlg.setMinimumWidth(480)
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(self._settings_widget(dlg))
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-        # Drop the QLabel reference when the dialog closes — the widget
-        # gets destroyed by Qt and any background thread that calls _set_status
-        # afterwards would otherwise hit "wrapped C/C++ object has been deleted".
-        dlg.finished.connect(lambda _: setattr(self, "_status_label", None))
-        dlg.exec()
+    # ------------------------------------------------------------------
+    # Settings dialog
+    # ------------------------------------------------------------------
+
+    def _open_settings_dialog(self, window):
+        d = WindowModalDialog(window, _('Connect to Bitcoin Core with EPS'))
+        d.setMinimumWidth(570)
+        vbox = QVBoxLayout(d)
+
+        warnings = []
+        if not self._active_wallet:
+            warnings.append(_("No wallet is open. You can configure EPS now; "
+                              "import and sync require a wallet."))
+        if not self.config.get("eps_rpc_user"):
+            warnings.append(_("RPC username is not configured yet."))
+
+        for text in warnings:
+            vbox.addWidget(helptext(text, True))
+
+        form = QFormLayout()
+        form.setLabelAlignment(_ALIGN_RIGHT_VCENTER)
+        vbox.addLayout(form)
+
+        # --- Bitcoin Core settings ---
+        form.addRow(title(_('Bitcoin Core settings')))
+
+        rpc_host = self.config.get("eps_rpc_host", "127.0.0.1")
+        rpc_port = self.config.get("eps_rpc_port", default_rpc_port())
+        url_e = input_field(_compose_rpc_url(rpc_host, rpc_port))
+        form.addRow(_('RPC URL:'), url_e)
+
+        auth_e = input_field(_compose_rpc_auth(
+            self.config.get("eps_rpc_user", ""),
+            self.config.get("eps_rpc_pass", ""),
+        ))
+        auth_e.setPlaceholderText('<username>:<password>')
+        auth_e.setEchoMode(_ECHO_PASSWORD)
+        form.addRow(_('RPC Auth:'), auth_e)
+        form.addRow('', helptext(_('Required. Bitcoin Core rpcuser/rpcpassword.'), False))
+
+        dir_e = input_field(self.config.get("eps_rpc_datadir", ""))
+        form.addRow(_('Directory:'), dir_e)
+        form.addRow('', helptext(
+            _('Bitcoin Core datadir (for cookie auth). Not used when RPC Auth is set.'),
+            False))
+
+        wallet_e = input_field(self.config.get("eps_rpc_wallet", ""), 150)
+        form.addRow(_('Wallet:'), wallet_e)
+        form.addRow('', helptext(
+            _('Optional named Core wallet (e.g. eps-test). Leave blank for default.'),
+            False))
+
+        # --- EPS server settings ---
+        form.addRow(title(_('EPS server settings')))
+
+        listen_host_e = input_field(self.config.get("eps_listen_host", "127.0.0.1"), 150)
+        form.addRow(_('Listen host:'), listen_host_e)
+
+        listen_port_e = QSpinBox()
+        listen_port_e.setRange(1024, 65535)
+        listen_port_e.setValue(int(self.config.get("eps_listen_port", 50002)))
+        listen_port_e.setMaximumWidth(150)
+        form.addRow(_('Listen port:'), listen_port_e)
+
+        gap_e = QSpinBox()
+        gap_e.setRange(5, 200)
+        gap_e.setValue(int(self.config.get("eps_gap_limit", 20)))
+        gap_e.setMaximumWidth(150)
+        form.addRow(_('Gap limit:'), gap_e)
+        form.addRow('', helptext(
+            _('Addresses beyond the last used to import into Core on bulk import.'),
+            False))
+
+        autostart_cb = checkbox(
+            _('Start server automatically when plugin is enabled'),
+            bool(self.config.get("eps_autostart", False)),
+        )
+        form.addRow('', autostart_cb)
+
+        # --- TLS ---
+        form.addRow(title(_('TLS certificate')))
+
+        from .tls import default_cert_paths
+        default_cert, default_key = default_cert_paths()
+
+        cert_e = input_field(self.config.get("eps_cert_path", default_cert))
+        cert_btn = QPushButton('…')
+        cert_btn.setMaximumWidth(30)
+        cert_row = QHBoxLayout()
+        cert_row.addWidget(cert_e)
+        cert_row.addWidget(cert_btn)
+        form.addRow(_('Certificate:'), cert_row)
+
+        key_e = input_field(self.config.get("eps_key_path", default_key))
+        key_btn = QPushButton('…')
+        key_btn.setMaximumWidth(30)
+        key_row = QHBoxLayout()
+        key_row.addWidget(key_e)
+        key_row.addWidget(key_btn)
+        form.addRow(_('Key:'), key_row)
+
+        gen_cert_btn = QPushButton(_('Generate self-signed certificate'))
+        form.addRow('', gen_cert_btn)
+
+        # --- Wallet import ---
+        form.addRow(title(_('Wallet import')))
+        import_btn = QPushButton(_('Import addresses from open wallet'))
+        form.addRow('', import_btn)
+        form.addRow('', helptext(
+            _('Required once per wallet. Triggers a Core rescan on first import.'),
+            False))
+
+        # --- Status / log ---
+        form.addRow(title(_('Status')))
+
+        self._status_label = QLabel(
+            _("Running") if self._server_running else _("Not started"))
+        self._status_label.setStyleSheet(
+            "color: green;" if self._server_running else "color: grey;")
+        status_row = QHBoxLayout()
+        status_row.addWidget(self._status_label)
+        btn_start = QPushButton(_('Start'))
+        btn_stop = QPushButton(_('Stop'))
+        status_row.addWidget(btn_start)
+        status_row.addWidget(btn_stop)
+        status_w = QWidget()
+        status_w.setLayout(status_row)
+        form.addRow('', status_w)
+
+        log_t = QTextEdit()
+        log_t.setReadOnly(True)
+        log_t.setFixedHeight(80)
+        log_t.setStyleSheet('QTextEdit { color: #888; font-size: 0.9em }')
+        log_t.setWordWrapMode(_WRAP_ANYWHERE)
+        log_t.hide()
+        form.addRow(log_t)
+        self._log_widget = log_t
+
+        def _pick_file(edit, caption):
+            path, _ = QFileDialog.getOpenFileName(
+                d, caption, "",
+                "PEM files (*.pem *.crt *.key);;All (*)")
+            if path:
+                edit.setText(path)
+
+        cert_btn.clicked.connect(lambda: _pick_file(cert_e, _('Select certificate')))
+        key_btn.clicked.connect(lambda: _pick_file(key_e, _('Select key')))
+
+        def _generate_cert():
+            from .tls import generate_self_signed_cert
+            cert = cert_e.text() or default_cert
+            key = key_e.text() or default_key
+            if generate_self_signed_cert(cert, key):
+                cert_e.setText(cert)
+                key_e.setText(key)
+                QMessageBox.information(d, "EPS", f"Certificate generated:\n{cert}")
+            else:
+                QMessageBox.critical(
+                    d, "EPS",
+                    "Failed to generate certificate.\n"
+                    "Ensure `openssl` is on PATH or install the `cryptography` package.")
+
+        gen_cert_btn.clicked.connect(_generate_cert)
+
+        def _apply_form_to_config():
+            host, port = _parse_rpc_url(url_e.text())
+            user, password = _parse_rpc_auth(auth_e.text())
+            self.config.set_key("eps_rpc_host", host)
+            self.config.set_key("eps_rpc_port", port)
+            self.config.set_key("eps_rpc_user", user)
+            self.config.set_key("eps_rpc_pass", password)
+            self.config.set_key("eps_rpc_datadir", dir_e.text().strip())
+            self.config.set_key("eps_rpc_wallet", wallet_e.text().strip())
+            self.config.set_key("eps_listen_host", listen_host_e.text().strip())
+            self.config.set_key("eps_listen_port", listen_port_e.value())
+            self.config.set_key("eps_gap_limit", gap_e.value())
+            self.config.set_key("eps_autostart", autostart_cb.isChecked())
+            self.config.set_key("eps_cert_path", cert_e.text().strip())
+            self.config.set_key("eps_key_path", key_e.text().strip())
+
+        def _can_connect() -> bool:
+            user, password = _parse_rpc_auth(auth_e.text())
+            return bool(user and password)
+
+        def _save_and_connect():
+            if not _can_connect():
+                QMessageBox.warning(
+                    d, "EPS",
+                    _("RPC Auth is required (username:password)."))
+                return
+            _apply_form_to_config()
+            log_t.clear()
+            log_t.show()
+            if self._server_running:
+                self.stop_server()
+            if self.start_server():
+                self._log("INFO", "Save & Connect completed")
+            else:
+                self._log("ERROR", "Failed to start EPS server")
+
+        def _start_from_form():
+            if not _can_connect():
+                QMessageBox.warning(
+                    d, "EPS",
+                    _("RPC Auth is required (username:password)."))
+                return
+            _apply_form_to_config()
+            log_t.show()
+            self.start_server()
+
+        save_b = QPushButton(_('Save && Connect'))
+        save_b.setDefault(True)
+        save_b.clicked.connect(_save_and_connect)
+
+        btn_start.clicked.connect(_start_from_form)
+        btn_stop.clicked.connect(self.stop_server)
+        import_btn.clicked.connect(
+            lambda: self.import_wallet_addresses(self._active_window, d))
+
+        if not self._active_wallet:
+            import_btn.setEnabled(False)
+
+        vbox.addLayout(Buttons(CloseButton(d), save_b))
+
+        def _cleanup():
+            self._status_label = None
+            self._log_widget = None
+
+        d.finished.connect(lambda _: _cleanup())
+        if hasattr(d, 'exec'):
+            d.exec()
+        else:
+            d.exec_()
 
     # ------------------------------------------------------------------
     # Import addresses action
     # ------------------------------------------------------------------
 
-    def import_wallet_addresses(self, window: "ElectrumWindow"):
-        wallet = window.wallet
-        if not wallet:
-            QMessageBox.warning(window, "EPS", "No wallet open.")
+    def import_wallet_addresses(self, window, parent=None):
+        if window is None or not getattr(window, "wallet", None):
+            QMessageBox.warning(
+                parent or window or self._active_window,
+                "EPS", _("No wallet open."))
             return
 
+        wallet = window.wallet
         rpc = self._build_rpc()
         gap_limit = int(self.config.get("eps_gap_limit", 20))
 
-        dlg = QProgressDialog("Importing addresses…", None, 0, 0, window)
+        dlg = QProgressDialog(_("Importing addresses…"), None, 0, 0, window)
         dlg.setWindowModality(_WINDOW_MODAL)
         dlg.setWindowTitle("Electrum Personal Server")
         dlg.show()
 
-        # Keep references on self so neither QThread nor worker get garbage-collected
-        # while the worker is still running (would cause "QThread destroyed while running").
         self._import_thread = QThread()
         self._import_worker = ImportWorker(rpc, wallet, gap_limit)
         self._import_worker.moveToThread(self._import_thread)
 
-        self._import_worker.progress.connect(dlg.setLabelText)
+        def _on_progress(msg):
+            dlg.setLabelText(msg)
+            self._log("INFO", msg)
+
+        self._import_worker.progress.connect(_on_progress)
 
         def _on_finished(ok, msg):
             dlg.close()
             if ok:
                 QMessageBox.information(window, "EPS", msg)
+                self._log("INFO", msg)
             else:
                 QMessageBox.critical(window, "EPS", f"Import failed: {msg}")
+                self._log("ERROR", msg)
 
         self._import_worker.finished.connect(_on_finished)
         self._import_thread.started.connect(self._import_worker.run)
-        # When the worker is done: quit the thread loop, then schedule cleanup
         self._import_worker.finished.connect(self._import_thread.quit)
         self._import_thread.finished.connect(self._import_worker.deleteLater)
         self._import_thread.finished.connect(self._import_thread.deleteLater)
-
         self._import_thread.start()
-
-    def _settings_widget(self, parent) -> QWidget:
-        w = QWidget(parent)
-        outer = QVBoxLayout(w)
-
-        # ---- Status ----
-        status_group = QGroupBox("Status")
-        sg_layout = QHBoxLayout(status_group)
-        self._status_label = QLabel("Not started")
-        self._status_label.setStyleSheet("color: grey;")
-        sg_layout.addWidget(self._status_label)
-
-        btn_start = QPushButton("Start")
-        btn_stop = QPushButton("Stop")
-        btn_start.clicked.connect(lambda: self.start_server())
-        btn_stop.clicked.connect(lambda: self.stop_server())
-        sg_layout.addWidget(btn_start)
-        sg_layout.addWidget(btn_stop)
-        outer.addWidget(status_group)
-
-        # ---- Bitcoin Core RPC ----
-        rpc_group = QGroupBox("Bitcoin Core RPC")
-        rg = QVBoxLayout(rpc_group)
-
-        def row(label, key, default, *, password=False):
-            h = QHBoxLayout()
-            h.addWidget(QLabel(label))
-            edit = QLineEdit(str(self.config.get(key, default)))
-            if password:
-                edit.setEchoMode(_ECHO_PASSWORD)
-            edit.textChanged.connect(lambda v: self.config.set_key(key, v))
-            h.addWidget(edit)
-            rg.addLayout(h)
-            return edit
-
-        row("Host:", "eps_rpc_host", "127.0.0.1")
-        row("Port:", "eps_rpc_port", 8332)
-        row("Username:", "eps_rpc_user", "")
-        row("Password:", "eps_rpc_pass", "", password=True)
-        row("Wallet (optional):", "eps_rpc_wallet", "")
-
-        rpc_group.setLayout(rg)
-        outer.addWidget(rpc_group)
-
-        # ---- Server settings ----
-        srv_group = QGroupBox("Server")
-        sg = QVBoxLayout(srv_group)
-
-        h = QHBoxLayout()
-        h.addWidget(QLabel("Listen host:"))
-        listen_host_edit = QLineEdit(self.config.get("eps_listen_host", "127.0.0.1"))
-        listen_host_edit.textChanged.connect(
-            lambda v: self.config.set_key("eps_listen_host", v))
-        h.addWidget(listen_host_edit)
-        sg.addLayout(h)
-
-        h = QHBoxLayout()
-        h.addWidget(QLabel("Listen port:"))
-        port_spin = QSpinBox()
-        port_spin.setRange(1024, 65535)
-        port_spin.setValue(int(self.config.get("eps_listen_port", 50002)))
-        port_spin.valueChanged.connect(
-            lambda v: self.config.set_key("eps_listen_port", v))
-        h.addWidget(port_spin)
-        sg.addLayout(h)
-
-        h = QHBoxLayout()
-        h.addWidget(QLabel("Gap limit:"))
-        gap_spin = QSpinBox()
-        gap_spin.setRange(5, 200)
-        gap_spin.setValue(int(self.config.get("eps_gap_limit", 20)))
-        gap_spin.valueChanged.connect(
-            lambda v: self.config.set_key("eps_gap_limit", v))
-        h.addWidget(gap_spin)
-        sg.addLayout(h)
-
-        autostart_cb = QCheckBox("Start server automatically on plugin enable")
-        autostart_cb.setChecked(bool(self.config.get("eps_autostart", False)))
-        autostart_cb.stateChanged.connect(
-            lambda v: self.config.set_key("eps_autostart", bool(v)))
-        sg.addWidget(autostart_cb)
-
-        outer.addWidget(srv_group)
-
-        # ---- TLS ----
-        tls_group = QGroupBox("TLS Certificate")
-        tg = QVBoxLayout(tls_group)
-
-        from .tls import default_cert_paths
-        default_cert, default_key = default_cert_paths()
-
-        def path_row(label, key, default):
-            h = QHBoxLayout()
-            h.addWidget(QLabel(label))
-            edit = QLineEdit(self.config.get(key, default))
-            edit.textChanged.connect(lambda v: self.config.set_key(key, v))
-            btn = QPushButton("…")
-            btn.setMaximumWidth(30)
-            btn.clicked.connect(lambda: (
-                edit.setText(QFileDialog.getOpenFileName(
-                    parent, f"Select {label}", "",
-                    "PEM files (*.pem *.crt *.key);;All (*)"
-                )[0] or edit.text())
-            ))
-            h.addWidget(edit)
-            h.addWidget(btn)
-            tg.addLayout(h)
-
-        path_row("Certificate:", "eps_cert_path", default_cert)
-        path_row("Key:", "eps_key_path", default_key)
-
-        btn_gen = QPushButton("Generate self-signed certificate")
-        def _gen():
-            from .tls import generate_self_signed_cert
-            cert = self.config.get("eps_cert_path", default_cert)
-            key  = self.config.get("eps_key_path", default_key)
-            if generate_self_signed_cert(cert, key):
-                QMessageBox.information(parent, "EPS", f"Certificate generated:\n{cert}")
-            else:
-                QMessageBox.critical(parent, "EPS",
-                    "Failed to generate certificate.\n"
-                    "Ensure `openssl` is on PATH or install the `cryptography` package.")
-        btn_gen.clicked.connect(_gen)
-        tg.addWidget(btn_gen)
-        outer.addWidget(tls_group)
-
-        # ---- Address import ----
-        imp_group = QGroupBox("Wallet Import")
-        ig = QVBoxLayout(imp_group)
-        ig.addWidget(QLabel(
-            "Import your wallet's addresses into Bitcoin Core.\n"
-            "Required once per wallet. A rescan will be triggered on first import."
-        ))
-        btn_import = QPushButton("Import addresses from open wallet")
-        btn_import.clicked.connect(
-            lambda: self.import_wallet_addresses(parent.parent()))
-        ig.addWidget(btn_import)
-        outer.addWidget(imp_group)
-
-        outer.addStretch()
-        return w
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -524,6 +732,7 @@ class Plugin(BasePlugin):
 
     def close(self):
         self.stop_server()
+        self._restore_network_settings()
         bridge = getattr(self, "_status_bridge", None)
         if bridge is not None:
             try:
