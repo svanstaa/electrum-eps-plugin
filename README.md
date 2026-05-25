@@ -64,11 +64,7 @@ background threads to the GUI are marshalled through a Qt signal
 server=1
 rpcuser=eps
 rpcpassword=eps          # use something secure outside testing
-# for testnet4:
-[test4]
-server=1
-rpcuser=eps
-rpcpassword=eps
+
 ```
 
 Create a dedicated watch-only descriptor wallet (Bitcoin Core ≥ 25):
