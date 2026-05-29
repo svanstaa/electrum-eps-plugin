@@ -48,10 +48,9 @@ def _script_type_for_keystore(ks) -> str:
 def _is_multisig_wallet(wallet) -> bool:
     """Best-effort detection of a multisig wallet.
 
-    Bulk import only builds single-sig descriptors (wpkh/sh(wpkh)/pkh), which
-    derive entirely different addresses than a multisig wsh(sortedmulti(...))
-    script. Importing those would make Core watch the wrong addresses, so we
-    detect multisig up front and refuse rather than fail silently.
+    Multisig and single-sig wallets need entirely different descriptors
+    (wsh(sortedmulti(...)) vs wpkh/sh(wpkh)/pkh), so import_wallet uses this to
+    route to the correct builder rather than deriving wrong addresses.
     """
     wallet_type = getattr(wallet, "wallet_type", "") or ""
     if "of" in wallet_type:  # e.g. "2of2", "2of3"
@@ -60,6 +59,45 @@ def _is_multisig_wallet(wallet) -> bool:
         return len(wallet.get_keystores()) > 1
     except Exception:
         return False
+
+
+# Electrum multisig txin_type → descriptor wrapper around sortedmulti(...).
+# Electrum multisig is BIP67-sorted, so `sortedmulti` (Core sorts the keys)
+# reproduces the exact same addresses regardless of cosigner order.
+_MULTISIG_WRAP = {
+    "p2wsh":      ("wsh(", ")"),          # native segwit multisig
+    "p2wsh-p2sh": ("sh(wsh(", "))"),      # nested segwit multisig
+    "p2sh":       ("sh(", ")"),           # legacy multisig
+}
+
+
+def _multisig_threshold(wallet) -> int:
+    """Return the required-signature count `m` of an m-of-n multisig wallet."""
+    m = getattr(wallet, "m", None)
+    if isinstance(m, int) and m > 0:
+        return m
+    wallet_type = getattr(wallet, "wallet_type", "") or ""
+    if "of" in wallet_type:  # e.g. "2of3"
+        try:
+            return int(wallet_type.split("of", 1)[0])
+        except ValueError:
+            pass
+    raise ValueError(
+        f"Could not determine multisig threshold (wallet_type={wallet_type!r}).")
+
+
+def _build_multisig_descriptor(xpubs, m: int, change: int,
+                               txin_type: str) -> str:
+    """Build a `sortedmulti` output descriptor (without checksum) for one branch.
+
+    Produces e.g. ``wsh(sortedmulti(2,xpubA/0/*,xpubB/0/*))``. Key origins are
+    omitted: they are only needed for signing, and EPS imports are watch-only,
+    so the derived addresses are identical with or without them.
+    """
+    prefix, suffix = _MULTISIG_WRAP.get(txin_type, _MULTISIG_WRAP["p2wsh"])
+    keys = ",".join(
+        f"{_to_canonical_xpub(x)}/{change}/*" for x in xpubs)
+    return f"{prefix}sortedmulti({m},{keys}){suffix}"
 
 
 def _to_canonical_xpub(xpub: str) -> str:
@@ -287,17 +325,13 @@ class AddressImporter:
         keystores = wallet.get_keystores()
         if not keystores:
             raise ValueError("Wallet has no keystores — cannot import.")
-        if _is_multisig_wallet(wallet):
-            raise ValueError(
-                "Multisig wallets are not supported by bulk import. "
-                "EPS would import incorrect single-sig addresses for each "
-                "cosigner key. Use a single-signature wallet, or rely on "
-                "protocol 1.7 on-demand watching instead."
-            )
 
         def progress(msg):
             if progress_cb:
                 progress_cb(msg)
+
+        if _is_multisig_wallet(wallet):
+            return self._import_multisig(wallet, progress)
 
         imported_any = False
         for i, ks in enumerate(keystores):
@@ -308,6 +342,46 @@ class AddressImporter:
             progress(f"Keystore {i}: importing addresses for {ks.xpub[:16]}…")
             newly_imported = self._import_keystore(ks, progress)
             if newly_imported:
+                imported_any = True
+
+        return imported_any
+
+    def _import_multisig(self, wallet, progress_cb) -> bool:
+        """Import an m-of-n multisig wallet as a single sortedmulti descriptor
+        per branch (receiving/change), mirroring the descriptor-based approach.
+
+        Watch-only and BIP67-sorted, so the addresses match what Electrum
+        derives regardless of cosigner order.
+        """
+        if not self._use_descriptors():
+            raise ValueError(
+                "Multisig bulk import requires Bitcoin Core 0.21+ "
+                "(importdescriptors). Upgrade Core, or rely on protocol 1.7 "
+                "on-demand watching instead."
+            )
+
+        keystores = wallet.get_keystores()
+        xpubs = [ks.xpub for ks in keystores
+                 if getattr(ks, "xpub", None)]
+        if len(xpubs) < 2:
+            raise ValueError(
+                "Multisig wallet exposes fewer than 2 cosigner xpubs — "
+                "cannot build a multisig descriptor.")
+
+        m = _multisig_threshold(wallet)
+        txin_type = getattr(wallet, "txin_type", "p2wsh") or "p2wsh"
+        count = IMPORT_ADDRESS_COUNT
+
+        imported_any = False
+        for change in (0, 1):
+            branch = "change" if change else "receiving"
+            progress_cb(
+                f"Importing {count} {len(xpubs)}-key multisig {branch} "
+                f"addresses…")
+            desc = _build_multisig_descriptor(xpubs, m, change, txin_type)
+            desc_with_checksum = add_descriptor_checksum(desc)
+            if self._send_descriptor_import(
+                    desc_with_checksum, count, internal=bool(change)):
                 imported_any = True
 
         return imported_any
@@ -349,14 +423,23 @@ class AddressImporter:
 
         # Bitcoin Core requires a checksum
         desc_with_checksum = add_descriptor_checksum(desc)
+        return self._send_descriptor_import(
+            desc_with_checksum, count, internal=change == 1)
 
+    def _send_descriptor_import(self, desc_with_checksum: str, count: int,
+                                internal: bool) -> bool:
+        """importdescriptors a single (checksummed) descriptor over [0, count-1].
+
+        Returns True if newly imported, False if Core reports it was already
+        present (error -4). Other errors propagate as RPCError.
+        """
         request = [{
             "desc": desc_with_checksum,
             "timestamp": "now",   # only scan from now; rescan separately
             "range": [0, count - 1],
             "watchonly": True,
             "keypool": False,
-            "internal": change == 1,
+            "internal": internal,
         }]
 
         try:
