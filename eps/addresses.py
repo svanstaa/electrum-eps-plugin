@@ -40,6 +40,23 @@ def _script_type_for_keystore(ks) -> str:
     return "standard"
 
 
+def _is_multisig_wallet(wallet) -> bool:
+    """Best-effort detection of a multisig wallet.
+
+    Bulk import only builds single-sig descriptors (wpkh/sh(wpkh)/pkh), which
+    derive entirely different addresses than a multisig wsh(sortedmulti(...))
+    script. Importing those would make Core watch the wrong addresses, so we
+    detect multisig up front and refuse rather than fail silently.
+    """
+    wallet_type = getattr(wallet, "wallet_type", "") or ""
+    if "of" in wallet_type:  # e.g. "2of2", "2of3"
+        return True
+    try:
+        return len(wallet.get_keystores()) > 1
+    except Exception:
+        return False
+
+
 def _to_canonical_xpub(xpub: str) -> str:
     """
     Bitcoin Core only accepts canonical BIP32 keys in descriptors
@@ -290,6 +307,13 @@ class AddressImporter:
         keystores = wallet.get_keystores()
         if not keystores:
             raise ValueError("Wallet has no keystores — cannot import.")
+        if _is_multisig_wallet(wallet):
+            raise ValueError(
+                "Multisig wallets are not supported by bulk import. "
+                "EPS would import incorrect single-sig addresses for each "
+                "cosigner key. Use a single-signature wallet, or rely on "
+                "protocol 1.7 on-demand watching instead."
+            )
 
         def progress(msg):
             if progress_cb:
