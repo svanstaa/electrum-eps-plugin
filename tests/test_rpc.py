@@ -3,6 +3,7 @@ Tests for eps.rpc — the synchronous Bitcoin Core JSON-RPC wrapper.
 All HTTP is mocked; no real node required.
 """
 import json
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 from io import BytesIO
@@ -11,7 +12,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from eps.rpc import BitcoinRPC, RPCError
+from eps.rpc import BitcoinRPC, RPCError, read_cookie_auth
 
 
 def _mock_response(result=None, error=None, status=200):
@@ -70,6 +71,38 @@ class TestBitcoinRPC(unittest.TestCase):
         self.rpc.listunspent(1, 9999999, ["bc1qtest"])
         body = json.loads(mock_urlopen.call_args[0][0].data)
         self.assertEqual(body["params"], [1, 9999999, ["bc1qtest"]])
+
+
+class TestReadCookieAuth(unittest.TestCase):
+
+    def _write_cookie(self, directory, content):
+        with open(os.path.join(directory, ".cookie"), "w") as f:
+            f.write(content)
+
+    def test_empty_datadir_returns_blank(self):
+        self.assertEqual(read_cookie_auth("", ""), ("", ""))
+
+    def test_reads_cookie_mainnet(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_cookie(d, "__cookie__:deadbeef")
+            self.assertEqual(read_cookie_auth(d, ""), ("__cookie__", "deadbeef"))
+
+    def test_reads_cookie_in_network_subdir(self):
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "testnet4")
+            os.makedirs(sub)
+            self._write_cookie(sub, "__cookie__:abc123")
+            self.assertEqual(read_cookie_auth(d, "testnet4"),
+                             ("__cookie__", "abc123"))
+
+    def test_missing_cookie_returns_blank(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(read_cookie_auth(d, ""), ("", ""))
+
+    def test_trailing_whitespace_stripped(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_cookie(d, "__cookie__:xyz\n")
+            self.assertEqual(read_cookie_auth(d, ""), ("__cookie__", "xyz"))
 
 
 if __name__ == "__main__":

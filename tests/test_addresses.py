@@ -41,6 +41,47 @@ class TestDescriptorChecksum(unittest.TestCase):
         self.assertEqual(cs1, cs2)
 
 
+class TestNormalizeScriptHex(unittest.TestCase):
+    """Validation/normalization of untrusted scriptPubKey hex from clients."""
+
+    def _norm(self, value, **kw):
+        from eps.addresses import normalize_script_hex
+        return normalize_script_hex(value, **kw)
+
+    def test_valid_hex_lowercased(self):
+        self.assertEqual(self._norm("76A914" + "11" * 20 + "88AC"),
+                         "76a914" + "11" * 20 + "88ac")
+
+    def test_whitespace_stripped(self):
+        self.assertEqual(self._norm("  0014" + "ab" * 20 + "\n"),
+                         "0014" + "ab" * 20)
+
+    def test_empty_rejected(self):
+        with self.assertRaises(ValueError):
+            self._norm("")
+
+    def test_whitespace_only_rejected(self):
+        with self.assertRaises(ValueError):
+            self._norm("   ")
+
+    def test_odd_length_rejected(self):
+        with self.assertRaises(ValueError):
+            self._norm("abc")
+
+    def test_non_hex_rejected(self):
+        with self.assertRaises(ValueError):
+            self._norm("zz" * 4)
+
+    def test_non_string_rejected(self):
+        with self.assertRaises(ValueError):
+            self._norm(b"0014")
+
+    def test_field_name_in_message(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._norm("xy", field="outpoint")
+        self.assertIn("outpoint", str(ctx.exception))
+
+
 class TestMerkleBranch(unittest.TestCase):
     """Test the Merkle branch computation in server.py."""
 

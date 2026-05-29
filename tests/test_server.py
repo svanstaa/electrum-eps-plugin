@@ -2,6 +2,7 @@
 Tests for eps.server — protocol dispatch, helper methods.
 Bitcoin Core RPC is mocked; no real node or Electrum install required.
 """
+import json
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
@@ -250,6 +251,63 @@ class TestBlockHeaders(unittest.TestCase):
         self.assertNotIn("headers", result)
         self.assertEqual(result["count"], 2)
         self.assertEqual(result["max"], 2016)
+
+
+class TestPushScriptNotifications(unittest.TestCase):
+    """H1 regression: each subscription type must be notified with the
+    identifier the client subscribed with (scripthash vs scriptPubKey)."""
+
+    def setUp(self):
+        self.server = _make_server()
+        # Non-empty history → non-None status, so a notification is emitted.
+        self.server._get_history = MagicMock(
+            return_value=[{"tx_hash": "aa" * 32, "height": 1}])
+
+    @staticmethod
+    def _sent(conn):
+        return [json.loads(call[0][0].decode())
+                for call in conn.sendall.call_args_list]
+
+    def test_scriptpubkey_notification_uses_spk_identifier(self):
+        spk = "76a914" + "11" * 20 + "88ac"
+        conn = MagicMock()
+        state = ClientState()
+        state.scriptpubkey_subs.add(spk)
+        self.server._clients["c1"] = (conn, state)
+
+        self.server._push_script_notifications()
+
+        msgs = self._sent(conn)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["method"], "blockchain.scriptpubkey.subscribe")
+        # The identifier must be the spk hex, NOT its scripthash.
+        self.assertEqual(msgs[0]["params"][0], spk)
+
+    def test_scripthash_notification_uses_scripthash_identifier(self):
+        sh = "ab" * 32
+        conn = MagicMock()
+        state = ClientState()
+        state.scripthash_subs.add(sh)
+        self.server._clients["c1"] = (conn, state)
+
+        self.server._push_script_notifications()
+
+        msgs = self._sent(conn)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["method"], "blockchain.scripthash.subscribe")
+        self.assertEqual(msgs[0]["params"][0], sh)
+
+    def test_unchanged_status_not_repushed(self):
+        spk = "76a914" + "22" * 20 + "88ac"
+        conn = MagicMock()
+        state = ClientState()
+        state.scriptpubkey_subs.add(spk)
+        self.server._clients["c1"] = (conn, state)
+
+        self.server._push_script_notifications()
+        self.server._push_script_notifications()  # status cached → no resend
+
+        self.assertEqual(conn.sendall.call_count, 1)
 
 
 if __name__ == "__main__":
