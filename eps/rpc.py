@@ -5,9 +5,37 @@
 
 import json
 import base64
+import logging
+import os
 import urllib.request
 import urllib.error
 from typing import Any
+
+logger = logging.getLogger("eps.rpc")
+
+
+def read_cookie_auth(datadir: str, subdir: str = "") -> tuple:
+    """Read Bitcoin Core's .cookie file → (user, password).
+
+    `subdir` is the per-network directory under `datadir` ('' for mainnet,
+    e.g. 'testnet3' / 'testnet4' / 'signet' / 'regtest' otherwise).
+
+    Returns ('', '') if `datadir` is empty or the cookie file cannot be read
+    (Core not running, wrong path, no read permission, or static
+    rpcuser/rpcpassword configured so Core writes no cookie).
+    """
+    if not datadir:
+        return "", ""
+    cookie_path = os.path.join(
+        os.path.expanduser(datadir), subdir, ".cookie")
+    try:
+        with open(cookie_path, "r") as f:
+            content = f.read().strip()
+    except OSError as e:
+        logger.warning(f"Could not read Bitcoin Core cookie at {cookie_path}: {e}")
+        return "", ""
+    user, _, password = content.partition(":")
+    return user, password
 
 
 class RPCError(Exception):

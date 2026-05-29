@@ -4,7 +4,6 @@
 # Manages the server lifecycle, settings UI, and wallet hooks.
 
 import logging
-import os
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
@@ -84,26 +83,6 @@ def _chain_subdir() -> str:
         'signet': 'signet',
     }.get(constants.net.NET_NAME, '')
 
-
-def _read_cookie_auth(datadir: str) -> tuple:
-    """Read Bitcoin Core's .cookie file under `datadir` for the active network.
-
-    Returns (user, password), or ('', '') if the datadir is empty or the
-    cookie file cannot be read (e.g. Core not running, wrong path, or no
-    read permission).
-    """
-    if not datadir:
-        return "", ""
-    cookie_path = os.path.join(
-        os.path.expanduser(datadir), _chain_subdir(), ".cookie")
-    try:
-        with open(cookie_path, "r") as f:
-            content = f.read().strip()
-    except OSError as e:
-        logger.warning(f"Could not read Bitcoin Core cookie at {cookie_path}: {e}")
-        return "", ""
-    user, _, password = content.partition(":")
-    return user, password
 
 
 def _compose_rpc_url(host: str, port) -> str:
@@ -292,7 +271,9 @@ class Plugin(BasePlugin):
         password = self.config.get("eps_rpc_pass", "")
         if user and password:
             return user, password
-        return _read_cookie_auth(self.config.get("eps_rpc_datadir", ""))
+        from .rpc import read_cookie_auth
+        return read_cookie_auth(
+            self.config.get("eps_rpc_datadir", ""), _chain_subdir())
 
     def _rpc_configured(self) -> bool:
         """True if EPS has enough info to attempt an RPC connection."""
