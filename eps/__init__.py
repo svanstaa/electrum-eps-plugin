@@ -7,8 +7,9 @@
 #   eps_rpc_pass        – RPC password
 #   eps_rpc_wallet      – optional named Core wallet (default: '')
 #   eps_rpc_datadir     – Bitcoin Core datadir (cookie auth; optional)
-#   eps_listen_host     – host to bind our Electrum server on (default: 127.0.0.1)
-#   eps_listen_port     – port to bind our Electrum server on (default: 50002)
+#
+# The EPS server always binds 127.0.0.1:50002 (see EPS_LISTEN_* in eps/qt.py);
+# the plugin auto-wires Electrum to it, so it is not user-configurable.
 #
 # TLS: a self-signed certificate is auto-generated on first start and stored under
 # the Electrum data directory (see eps/tls.py); no user configuration required.

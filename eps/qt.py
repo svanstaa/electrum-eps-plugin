@@ -12,7 +12,7 @@ from xml.sax.saxutils import escape
 try:
     from PyQt6.QtWidgets import (
         QFormLayout, QLabel,
-        QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
+        QLineEdit, QMessageBox, QProgressDialog, QPushButton,
         QTextEdit, QVBoxLayout,
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
@@ -24,7 +24,7 @@ try:
 except ImportError:
     from PyQt5.QtWidgets import (
         QFormLayout, QLabel,
-        QLineEdit, QMessageBox, QProgressDialog, QPushButton, QSpinBox,
+        QLineEdit, QMessageBox, QProgressDialog, QPushButton,
         QTextEdit, QVBoxLayout,
     )
     from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
@@ -44,6 +44,12 @@ if TYPE_CHECKING:
     from electrum.gui.qt.main_window import ElectrumWindow
 
 logger = logging.getLogger("eps.plugin")
+
+# EPS binds its Electrum server here. Hardcoded: the plugin auto-wires Electrum
+# to its own server, so the user never needs these. 127.0.0.1 keeps the
+# wallet-tracking server off the network.
+EPS_LISTEN_HOST = "127.0.0.1"
+EPS_LISTEN_PORT = 50002
 
 _LOG_COLORS = {
     'ERROR': '#CD0200',
@@ -333,8 +339,8 @@ class Plugin(BasePlugin):
         from .server import ElectrumServer
         self._server = ElectrumServer(
             rpc=rpc,
-            host=self.config.get("eps_listen_host", "127.0.0.1"),
-            port=int(self.config.get("eps_listen_port", 50002)),
+            host=EPS_LISTEN_HOST,
+            port=EPS_LISTEN_PORT,
             certfile=cert_path,
             keyfile=key_path,
         )
@@ -346,14 +352,12 @@ class Plugin(BasePlugin):
         self._server.start()
         self._server_running = True
 
-        listen_host = self.config.get("eps_listen_host", "127.0.0.1")
-        listen_port = self.config.get("eps_listen_port", 50002)
         self._eps_scheme = "s" if (cert_path and key_path) else "t"
 
         self._bookmark_eps_server(add=True)
         self._auto_configure_network()
 
-        self._set_status(f"Running on {listen_host}:{listen_port}")
+        self._set_status(f"Running on {EPS_LISTEN_HOST}:{EPS_LISTEN_PORT}")
 
         if self._active_wallet:
             self._register_wallet_addresses(self._active_wallet)
@@ -393,8 +397,8 @@ class Plugin(BasePlugin):
             from electrum.interface import ServerAddr
         except ImportError:
             return None
-        host = self.config.get("eps_listen_host", "127.0.0.1")
-        port = int(self.config.get("eps_listen_port", 50002))
+        host = EPS_LISTEN_HOST
+        port = EPS_LISTEN_PORT
         scheme = getattr(self, "_eps_scheme", "s")
         try:
             return ServerAddr.from_str(f"{host}:{port}:{scheme}")
@@ -557,18 +561,6 @@ class Plugin(BasePlugin):
             _('Optional named Core wallet (e.g. eps-test). Leave blank for default.'),
             False))
 
-        # --- EPS server settings ---
-        form.addRow(title(_('EPS server settings')))
-
-        listen_host_e = input_field(self.config.get("eps_listen_host", "127.0.0.1"), 150)
-        form.addRow(_('Listen host:'), listen_host_e)
-
-        listen_port_e = QSpinBox()
-        listen_port_e.setRange(1024, 65535)
-        listen_port_e.setValue(int(self.config.get("eps_listen_port", 50002)))
-        listen_port_e.setMaximumWidth(150)
-        form.addRow(_('Listen port:'), listen_port_e)
-
         # --- Wallet import ---
         form.addRow(title(_('Wallet import')))
         import_btn = QPushButton(_('Import addresses from open wallet'))
@@ -604,8 +596,6 @@ class Plugin(BasePlugin):
             self.config.set_key("eps_rpc_pass", password)
             self.config.set_key("eps_rpc_datadir", dir_e.text().strip())
             self.config.set_key("eps_rpc_wallet", wallet_e.text().strip())
-            self.config.set_key("eps_listen_host", listen_host_e.text().strip())
-            self.config.set_key("eps_listen_port", listen_port_e.value())
 
         def _can_connect() -> bool:
             user, password = _parse_rpc_auth(auth_e.text())
