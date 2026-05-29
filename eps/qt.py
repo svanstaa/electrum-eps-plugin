@@ -4,6 +4,7 @@
 # Manages the server lifecycle, settings UI, and wallet hooks.
 
 import logging
+import os
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
@@ -64,6 +65,39 @@ def default_rpc_port() -> int:
 
 def default_rpc_url() -> str:
     return f"http://127.0.0.1:{default_rpc_port()}/"
+
+
+def _chain_subdir() -> str:
+    """Bitcoin Core stores per-network data (incl. .cookie) in a subdir of the
+    datadir for every chain except mainnet."""
+    return {
+        'mainnet': '',
+        'testnet': 'testnet3',
+        'testnet4': 'testnet4',
+        'regtest': 'regtest',
+        'signet': 'signet',
+    }.get(constants.net.NET_NAME, '')
+
+
+def _read_cookie_auth(datadir: str) -> tuple:
+    """Read Bitcoin Core's .cookie file under `datadir` for the active network.
+
+    Returns (user, password), or ('', '') if the datadir is empty or the
+    cookie file cannot be read (e.g. Core not running, wrong path, or no
+    read permission).
+    """
+    if not datadir:
+        return "", ""
+    cookie_path = os.path.join(
+        os.path.expanduser(datadir), _chain_subdir(), ".cookie")
+    try:
+        with open(cookie_path, "r") as f:
+            content = f.read().strip()
+    except OSError as e:
+        logger.warning(f"Could not read Bitcoin Core cookie at {cookie_path}: {e}")
+        return "", ""
+    user, _, password = content.partition(":")
+    return user, password
 
 
 def _compose_rpc_url(host: str, port) -> str:
@@ -223,7 +257,7 @@ class Plugin(BasePlugin):
         self._active_window = window
         self._active_wallet = wallet
         if not self._server_running:
-            if not self.config.get("eps_rpc_user"):
+            if not self._rpc_configured():
                 logger.info("EPS: wallet opened but RPC not configured")
                 return
             if not self.start_server():
@@ -242,13 +276,31 @@ class Plugin(BasePlugin):
     # Server lifecycle
     # ------------------------------------------------------------------
 
+    def _resolve_rpc_auth(self) -> tuple:
+        """Return (user, password) for Core RPC.
+
+        Explicit rpcuser/rpcpassword wins; otherwise fall back to reading the
+        .cookie file from the configured datadir.
+        """
+        user = self.config.get("eps_rpc_user", "")
+        password = self.config.get("eps_rpc_pass", "")
+        if user and password:
+            return user, password
+        return _read_cookie_auth(self.config.get("eps_rpc_datadir", ""))
+
+    def _rpc_configured(self) -> bool:
+        """True if EPS has enough info to attempt an RPC connection."""
+        return bool(self.config.get("eps_rpc_user")
+                    or self.config.get("eps_rpc_datadir"))
+
     def _build_rpc(self):
         from .rpc import BitcoinRPC
+        user, password = self._resolve_rpc_auth()
         return BitcoinRPC(
             host=self.config.get("eps_rpc_host", "127.0.0.1"),
             port=int(self.config.get("eps_rpc_port", default_rpc_port())),
-            user=self.config.get("eps_rpc_user", ""),
-            password=self.config.get("eps_rpc_pass", ""),
+            user=user,
+            password=password,
             wallet=self.config.get("eps_rpc_wallet", ""),
         )
 
@@ -465,8 +517,9 @@ class Plugin(BasePlugin):
         if not self._active_wallet:
             warnings.append(_("No wallet is open. You can configure EPS now; "
                               "import and sync require a wallet."))
-        if not self.config.get("eps_rpc_user"):
-            warnings.append(_("RPC username is not configured yet."))
+        if not self._rpc_configured():
+            warnings.append(_("RPC auth is not configured yet "
+                              "(set username:password, or a datadir for cookie auth)."))
 
         for text in warnings:
             vbox.addWidget(helptext(text, True))
@@ -556,13 +609,17 @@ class Plugin(BasePlugin):
 
         def _can_connect() -> bool:
             user, password = _parse_rpc_auth(auth_e.text())
-            return bool(user and password)
+            if user and password:
+                return True
+            # Fall back to cookie auth if a datadir is supplied.
+            return bool(dir_e.text().strip())
 
         def _save_and_connect():
             if not _can_connect():
                 QMessageBox.warning(
                     d, "EPS",
-                    _("RPC Auth is required (username:password)."))
+                    _("Provide RPC Auth (username:password) "
+                      "or a Bitcoin Core datadir for cookie auth."))
                 return
             _apply_form_to_config()
             log_t.clear()
