@@ -21,8 +21,8 @@ class TestDescriptorChecksum(unittest.TestCase):
     """
 
     def _checksum(self, desc: str) -> str:
-        from eps.addresses import AddressImporter
-        result = AddressImporter._add_descriptor_checksum(desc)
+        from eps.addresses import add_descriptor_checksum
+        result = add_descriptor_checksum(desc)
         return result.split("#")[1] if "#" in result else ""
 
     def test_pkh_checksum(self):

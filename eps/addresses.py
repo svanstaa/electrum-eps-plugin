@@ -5,7 +5,7 @@
 
 import hashlib
 import threading
-from typing import Dict, Iterator, List, Tuple, Optional, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING
 
 from electrum.bip32 import BIP32Node
 from electrum import bitcoin
@@ -68,46 +68,6 @@ def _to_canonical_xpub(xpub: str) -> str:
     if node.xtype == "standard":
         return xpub
     return node._replace(xtype="standard").to_xpub()
-
-
-def _descriptor_for_xpub(xpub: str, script_type: str,
-                          change: int, start: int, end: int) -> str:
-    """
-    Build a Bitcoin Core output descriptor for a range of addresses.
-
-    e.g. wpkh([fingerprint/84h/0h/0h]xpub.../0/0:99)
-    """
-    tmpl = _XPUB_TYPE_TO_SCRIPT.get(script_type, "pkh")
-    path = f"{xpub}/{change}/{start}:{end}"
-
-    if tmpl == "sh(wpkh":
-        return f"sh(wpkh({path}))"
-    return f"{tmpl}({path})"
-
-
-def derive_addresses(ks, change: int, count: int) -> List[str]:
-    """
-    Derive `count` addresses from keystore `ks` on branch `change`
-    (0 = receiving, 1 = change) using Electrum's own BIP32 code.
-    """
-    node = BIP32Node.from_xkey(ks.xpub)
-    branch_node = node.subkey_at_public_derivation([change])
-    script_type = _script_type_for_keystore(ks)
-
-    addresses = []
-    for i in range(count):
-        child = branch_node.subkey_at_public_derivation([i])
-        pubkey_bytes = child.eckey.get_public_key_bytes(compressed=True)
-
-        if script_type == "p2wpkh":
-            addr = bitcoin.pubkey_to_address("p2wpkh", pubkey_bytes.hex())
-        elif script_type == "p2wpkh-p2sh":
-            addr = bitcoin.pubkey_to_address("p2wpkh-p2sh", pubkey_bytes.hex())
-        else:
-            addr = bitcoin.pubkey_to_address("p2pkh", pubkey_bytes.hex())
-
-        addresses.append(addr)
-    return addresses
 
 
 def normalize_script_hex(value: str, *, field: str = "scriptpubkey") -> str:
@@ -280,9 +240,6 @@ class ScriptWatcher:
             return None
         return bytes.fromhex(spk_hex)
 
-    def script_for_spk(self, spk_hex: str) -> bytes:
-        return bytes.fromhex(spk_hex.lower().strip())
-
 
 # ---------------------------------------------------------------------------
 # Import management
@@ -441,12 +398,3 @@ class AddressImporter:
 
         results = self.rpc.importmulti(requests, {"rescan": False})
         return any(r.get("success") for r in results)
-
-    # ------------------------------------------------------------------
-    # Descriptor checksum (required by Core >= 0.20)
-    # Ported from bitcoin/src/script/descriptor.cpp
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _add_descriptor_checksum(desc: str) -> str:
-        return _descriptor_checksum(desc)
