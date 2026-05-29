@@ -3,7 +3,7 @@ Tests for eps.addresses — descriptor checksum and Merkle branch.
 These have no Electrum or Bitcoin Core dependency.
 """
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import sys
 import os
 
@@ -80,6 +80,149 @@ class TestNormalizeScriptHex(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self._norm("xy", field="outpoint")
         self.assertIn("outpoint", str(ctx.exception))
+
+
+class TestMultisigDetection(unittest.TestCase):
+    """`_is_multisig_wallet` routing and the empty-wallet guard."""
+
+    class _Wallet:
+        def __init__(self, wallet_type="standard", keystores=None):
+            self.wallet_type = wallet_type
+            self._keystores = [] if keystores is None else keystores
+
+        def get_keystores(self):
+            return self._keystores
+
+    def _importer(self):
+        from eps.addresses import AddressImporter
+        return AddressImporter(MagicMock())
+
+    def test_detects_multisig_by_wallet_type(self):
+        from eps.addresses import _is_multisig_wallet
+        # "of" in the type name (2of3) flags it even with one keystore visible.
+        self.assertTrue(_is_multisig_wallet(self._Wallet("2of3", [object()])))
+
+    def test_detects_multisig_by_keystore_count(self):
+        from eps.addresses import _is_multisig_wallet
+        self.assertTrue(_is_multisig_wallet(
+            self._Wallet("standard", [object(), object()])))
+
+    def test_single_sig_not_multisig(self):
+        from eps.addresses import _is_multisig_wallet
+        self.assertFalse(_is_multisig_wallet(self._Wallet("standard", [object()])))
+
+    def test_keystores_error_treated_as_single_sig(self):
+        from eps.addresses import _is_multisig_wallet
+
+        class _Raising:
+            wallet_type = ""
+
+            def get_keystores(self):
+                raise RuntimeError("boom")
+
+        self.assertFalse(_is_multisig_wallet(_Raising()))
+
+    def test_import_wallet_rejects_no_keystores(self):
+        importer = self._importer()
+        with self.assertRaises(ValueError) as ctx:
+            importer.import_wallet(self._Wallet("standard", []))
+        self.assertIn("keystore", str(ctx.exception).lower())
+
+
+class TestMultisigImport(unittest.TestCase):
+    """Success-path tests for sortedmulti descriptor import (Core 0.21+)."""
+
+    class _KS:
+        def __init__(self, xpub):
+            self.xpub = xpub
+
+    class _Wallet:
+        def __init__(self, m=2, xpubs=("xpubONE", "xpubTWO", "xpubTHREE"),
+                     txin_type="p2wsh", wallet_type=None):
+            self.m = m
+            self.txin_type = txin_type
+            self.wallet_type = (wallet_type if wallet_type is not None
+                                else f"{m}of{len(xpubs)}")
+            self._keystores = [TestMultisigImport._KS(x) for x in xpubs]
+
+        def get_keystores(self):
+            return self._keystores
+
+    def setUp(self):
+        # _to_canonical_xpub needs real electrum crypto; stub to identity so we
+        # can assert on the descriptor strings directly.
+        patcher = patch("eps.addresses._to_canonical_xpub",
+                        side_effect=lambda x: x)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def _importer(self, version=210000, import_result=None):
+        from eps.addresses import AddressImporter
+        imp = AddressImporter(MagicMock())
+        imp.rpc.getnetworkinfo.return_value = {"version": version}
+        imp.rpc.importdescriptors.return_value = (
+            import_result if import_result is not None else [{"success": True}])
+        return imp
+
+    def _requests(self, imp):
+        return [call[0][0][0]
+                for call in imp.rpc.importdescriptors.call_args_list]
+
+    def test_imports_both_branches_native_segwit(self):
+        imp = self._importer()
+        self.assertTrue(imp.import_wallet(self._Wallet()))
+        reqs = self._requests(imp)
+        self.assertEqual(len(reqs), 2)
+
+        recv, change = reqs
+        self.assertEqual(
+            recv["desc"].split("#")[0],
+            "wsh(sortedmulti(2,xpubONE/0/*,xpubTWO/0/*,xpubTHREE/0/*))")
+        self.assertFalse(recv["internal"])
+        self.assertEqual(recv["range"], [0, 99])
+
+        self.assertEqual(
+            change["desc"].split("#")[0],
+            "wsh(sortedmulti(2,xpubONE/1/*,xpubTWO/1/*,xpubTHREE/1/*))")
+        self.assertTrue(change["internal"])
+
+    def test_nested_segwit_wrap(self):
+        imp = self._importer()
+        imp.import_wallet(self._Wallet(txin_type="p2wsh-p2sh"))
+        self.assertTrue(
+            self._requests(imp)[0]["desc"].startswith("sh(wsh(sortedmulti(2,"))
+
+    def test_legacy_p2sh_wrap(self):
+        imp = self._importer()
+        imp.import_wallet(self._Wallet(txin_type="p2sh"))
+        desc = self._requests(imp)[0]["desc"]
+        self.assertTrue(desc.startswith("sh(sortedmulti(2,"))
+        self.assertFalse(desc.startswith("sh(wsh"))
+
+    def test_threshold_from_wallet_type_when_m_missing(self):
+        imp = self._importer()
+        imp.import_wallet(self._Wallet(m=None, wallet_type="2of3"))
+        self.assertIn("sortedmulti(2,", self._requests(imp)[0]["desc"])
+
+    def test_already_imported_returns_false(self):
+        imp = self._importer(
+            import_result=[{"success": False, "error": {"code": -4}}])
+        self.assertFalse(imp.import_wallet(self._Wallet()))
+        self.assertEqual(len(self._requests(imp)), 2)
+
+    def test_requires_core_021(self):
+        imp = self._importer(version=200000)
+        with self.assertRaises(ValueError) as ctx:
+            imp.import_wallet(self._Wallet())
+        self.assertIn("0.21", str(ctx.exception))
+        imp.rpc.importdescriptors.assert_not_called()
+
+    def test_fewer_than_two_cosigner_xpubs_raises(self):
+        imp = self._importer()
+        wallet = self._Wallet(xpubs=("only", None), wallet_type="2of2")
+        with self.assertRaises(ValueError) as ctx:
+            imp.import_wallet(wallet)
+        self.assertIn("fewer than 2", str(ctx.exception))
 
 
 class TestMerkleBranch(unittest.TestCase):
