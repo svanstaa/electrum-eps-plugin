@@ -964,26 +964,22 @@ class ElectrumServer:
         with self._clients_lock:
             clients = list(self._clients.values())
 
+        # --- scripthash subscriptions (protocol <= 1.6) ---
+        # Notification identifier is the scripthash the client subscribed with.
         watched_sh: set = set()
         for _conn, state in clients:
             watched_sh.update(state.scripthash_subs)
-            for spk in state.scriptpubkey_subs:
-                watched_sh.add(scriptpubkey_to_scripthash(bytes.fromhex(spk)))
 
         for sh in watched_sh:
             status = self._history_status(self._get_history(scripthash=sh))
-            if self._status_cache.get(sh) == status:
+            cache_key = ("sh", sh)
+            if self._status_cache.get(cache_key) == status:
                 continue
-            self._status_cache[sh] = status
+            self._status_cache[cache_key] = status
 
-            sh_notif = json.dumps({
+            notif = json.dumps({
                 "jsonrpc": "2.0",
                 "method": "blockchain.scripthash.subscribe",
-                "params": [sh, status],
-            }).encode() + b"\n"
-            spk_notif = json.dumps({
-                "jsonrpc": "2.0",
-                "method": "blockchain.scriptpubkey.subscribe",
                 "params": [sh, status],
             }).encode() + b"\n"
 
@@ -991,13 +987,34 @@ class ElectrumServer:
                 if sh in state.scripthash_subs:
                     try:
                         with state.write_lock:
-                            conn.sendall(sh_notif)
+                            conn.sendall(notif)
                     except OSError:
                         pass
-                if any(scriptpubkey_to_scripthash(bytes.fromhex(spk)) == sh
-                       for spk in state.scriptpubkey_subs):
+
+        # --- scriptpubkey subscriptions (protocol >= 1.7) ---
+        # The client matches notifications by the scriptPubKey it subscribed
+        # with, so the identifier here MUST be the spk hex (not its scripthash).
+        watched_spk: set = set()
+        for _conn, state in clients:
+            watched_spk.update(state.scriptpubkey_subs)
+
+        for spk in watched_spk:
+            status = self._history_status(self._get_history(spk_hex=spk))
+            cache_key = ("spk", spk)
+            if self._status_cache.get(cache_key) == status:
+                continue
+            self._status_cache[cache_key] = status
+
+            notif = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "blockchain.scriptpubkey.subscribe",
+                "params": [spk, status],
+            }).encode() + b"\n"
+
+            for conn, state in clients:
+                if spk in state.scriptpubkey_subs:
                     try:
                         with state.write_lock:
-                            conn.sendall(spk_notif)
+                            conn.sendall(notif)
                     except OSError:
                         pass
