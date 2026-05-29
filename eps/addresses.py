@@ -246,30 +246,44 @@ class ScriptWatcher:
             except Exception:
                 address = None
 
-        if address:
-            desc = add_descriptor_checksum(f"addr({address})")
-        else:
-            desc = add_descriptor_checksum(f"raw({spk_hex})")
+        # Only import a bare addr()/raw() watch if Core isn't already tracking
+        # this script via a wallet descriptor (e.g. a bulk xpub/multisig
+        # import). Otherwise we'd add a redundant, less-informative descriptor
+        # that shadows the richer one in getaddressinfo.
+        if not (address and self._core_already_watches(address)):
+            if address:
+                desc = add_descriptor_checksum(f"addr({address})")
+            else:
+                desc = add_descriptor_checksum(f"raw({spk_hex})")
 
-        request = [{
-            "desc": desc,
-            "timestamp": "now",
-            "watchonly": True,
-            "keypool": False,
-        }]
-        results = self.rpc.importdescriptors(request)
-        for r in results:
-            if not r.get("success"):
-                err = r.get("error", {})
-                if err.get("code") == -4:
-                    break
-                raise RPCError(err.get("code", -1), err.get("message", "unknown"))
+            request = [{
+                "desc": desc,
+                "timestamp": "now",
+                "watchonly": True,
+                "keypool": False,
+            }]
+            results = self.rpc.importdescriptors(request)
+            for r in results:
+                if not r.get("success"):
+                    err = r.get("error", {})
+                    if err.get("code") == -4:
+                        break
+                    raise RPCError(err.get("code", -1), err.get("message", "unknown"))
 
         sh = scriptpubkey_to_scripthash(script)
         with self._lock:
             self._imported_spks.add(spk_hex)
             self._spk_to_address.setdefault(spk_hex, address)
             self._sh_to_spk[sh] = spk_hex
+
+    def _core_already_watches(self, address: str) -> bool:
+        """True if a wallet descriptor in Core already covers `address`, so an
+        on-demand bare addr() watch would be redundant."""
+        try:
+            info = self.rpc.getaddressinfo(address)
+        except RPCError:
+            return False
+        return bool(info.get("ismine") or info.get("iswatchonly"))
 
     def address_for_scripthash(self, scripthash: str) -> Optional[str]:
         spk_hex = self._sh_to_spk.get(scripthash)

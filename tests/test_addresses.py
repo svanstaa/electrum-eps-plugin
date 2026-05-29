@@ -225,6 +225,35 @@ class TestMultisigImport(unittest.TestCase):
         self.assertIn("fewer than 2", str(ctx.exception))
 
 
+class TestScriptWatcherDedup(unittest.TestCase):
+    """On-demand watcher must not re-import a bare addr() when Core already
+    tracks the script via a wallet descriptor (e.g. a bulk import)."""
+
+    def _watcher(self, ismine):
+        from eps.addresses import ScriptWatcher
+        rpc = MagicMock()
+        rpc.getaddressinfo.return_value = {"ismine": ismine}
+        rpc.importdescriptors.return_value = [{"success": True}]
+        return ScriptWatcher(rpc), rpc
+
+    def test_skips_import_when_core_already_watches(self):
+        spk = "0014" + "11" * 20
+        w, rpc = self._watcher(ismine=True)
+        w._spk_to_address[spk] = "tb1qexample"  # avoid electrum address calc
+        w.ensure_watched(spk)
+        rpc.importdescriptors.assert_not_called()
+        self.assertIn(spk, w._imported_spks)  # still tracked locally
+
+    def test_imports_when_core_does_not_watch(self):
+        spk = "0014" + "22" * 20
+        w, rpc = self._watcher(ismine=False)
+        w._spk_to_address[spk] = "tb1qexample2"
+        w.ensure_watched(spk)
+        rpc.importdescriptors.assert_called_once()
+        desc = rpc.importdescriptors.call_args[0][0][0]["desc"]
+        self.assertTrue(desc.startswith("addr(tb1qexample2)"))
+
+
 class TestMerkleBranch(unittest.TestCase):
     """Test the Merkle branch computation in server.py."""
 
