@@ -110,6 +110,25 @@ def derive_addresses(ks, change: int, count: int) -> List[str]:
     return addresses
 
 
+def normalize_script_hex(value: str, *, field: str = "scriptpubkey") -> str:
+    """Validate and normalize a hex string received from an (untrusted) client.
+
+    Returns the lower-cased hex. Raises ValueError on anything that is not
+    non-empty, even-length hexadecimal, so callers don't pass garbage straight
+    into ``bytes.fromhex`` (which would surface as an opaque internal error).
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"invalid {field}: expected a hex string")
+    h = value.strip().lower()
+    if not h or len(h) % 2 != 0:
+        raise ValueError(f"invalid {field}: expected non-empty even-length hex")
+    try:
+        bytes.fromhex(h)
+    except ValueError:
+        raise ValueError(f"invalid {field}: not hexadecimal")
+    return h
+
+
 def scriptpubkey_to_scripthash(script: bytes) -> str:
     """Electrum scripthash from raw scriptPubKey bytes (reverse SHA256)."""
     if isinstance(script, str):
@@ -211,7 +230,7 @@ class ScriptWatcher:
             return self._spk_to_address.get(spk_hex.lower().strip())
 
     def ensure_watched(self, spk_hex: str) -> None:
-        spk_hex = spk_hex.lower().strip()
+        spk_hex = normalize_script_hex(spk_hex)
         with self._lock:
             if spk_hex in self._imported_spks:
                 return
