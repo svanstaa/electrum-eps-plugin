@@ -24,6 +24,11 @@ _XPUB_TYPE_TO_SCRIPT = {
     "p2wpkh":     "wpkh",    # zpub  → P2WPKH (native segwit)
 }
 
+# How many addresses to bulk-import into Core per branch (receiving/change).
+# With protocol 1.7, anything beyond this range is still picked up on demand
+# via scriptpubkey.subscribe, so this only bounds the initial import + rescan.
+IMPORT_ADDRESS_COUNT = 100
+
 
 def _script_type_for_keystore(ks) -> str:
     """Infer script type from the keystore's xpub version bytes.
@@ -255,9 +260,8 @@ class AddressImporter:
       - Older Core: fall back to importmulti
     """
 
-    def __init__(self, rpc: BitcoinRPC, gap_limit: int = 20):
+    def __init__(self, rpc: BitcoinRPC):
         self.rpc = rpc
-        self.gap_limit = gap_limit
         self._core_version: Optional[int] = None
 
     def _get_core_version(self) -> int:
@@ -312,7 +316,7 @@ class AddressImporter:
         """Import one keystore's receiving and change addresses."""
         xpub = ks.xpub
         script_type = _script_type_for_keystore(ks)
-        count = self.gap_limit + 50  # import generously
+        count = IMPORT_ADDRESS_COUNT
 
         newly_imported = False
 

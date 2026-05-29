@@ -147,16 +147,15 @@ class ImportWorker(QObject):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, rpc, wallet, gap_limit):
+    def __init__(self, rpc, wallet):
         super().__init__()
         self.rpc = rpc
         self.wallet = wallet
-        self.gap_limit = gap_limit
 
     def run(self):
         try:
             from .addresses import AddressImporter
-            importer = AddressImporter(self.rpc, self.gap_limit)
+            importer = AddressImporter(self.rpc)
 
             self.progress.emit(_("Importing addresses into Bitcoin Core…"))
             imported_new = importer.import_wallet(
@@ -517,15 +516,6 @@ class Plugin(BasePlugin):
         listen_port_e.setMaximumWidth(150)
         form.addRow(_('Listen port:'), listen_port_e)
 
-        gap_e = QSpinBox()
-        gap_e.setRange(5, 200)
-        gap_e.setValue(int(self.config.get("eps_gap_limit", 20)))
-        gap_e.setMaximumWidth(150)
-        form.addRow(_('Gap limit:'), gap_e)
-        form.addRow('', helptext(
-            _('Addresses beyond the last used to import into Core on bulk import.'),
-            False))
-
         # --- Wallet import ---
         form.addRow(title(_('Wallet import')))
         import_btn = QPushButton(_('Import addresses from open wallet'))
@@ -563,7 +553,6 @@ class Plugin(BasePlugin):
             self.config.set_key("eps_rpc_wallet", wallet_e.text().strip())
             self.config.set_key("eps_listen_host", listen_host_e.text().strip())
             self.config.set_key("eps_listen_port", listen_port_e.value())
-            self.config.set_key("eps_gap_limit", gap_e.value())
 
         def _can_connect() -> bool:
             user, password = _parse_rpc_auth(auth_e.text())
@@ -620,7 +609,6 @@ class Plugin(BasePlugin):
 
         wallet = window.wallet
         rpc = self._build_rpc()
-        gap_limit = int(self.config.get("eps_gap_limit", 20))
 
         dlg = QProgressDialog(_("Importing addresses…"), None, 0, 0, window)
         dlg.setWindowModality(_WINDOW_MODAL)
@@ -628,7 +616,7 @@ class Plugin(BasePlugin):
         dlg.show()
 
         self._import_thread = QThread()
-        self._import_worker = ImportWorker(rpc, wallet, gap_limit)
+        self._import_worker = ImportWorker(rpc, wallet)
         self._import_worker.moveToThread(self._import_thread)
 
         def _on_progress(msg):
