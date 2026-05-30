@@ -4,26 +4,34 @@ An Electrum plugin that reimplements [Electrum Personal Server](https://github.c
 functionality inline, letting you connect Electrum to your own Bitcoin
 Core full node without running a separate process.
 
-Tested against Electrum 4.7.2 (AppImage, PyQt6) and Bitcoin Core 30 on
-testnet4 and mainnet.
+Tested against Electrum's `1.7` protocol branch (PyQt6) and Bitcoin
+Core 30 on testnet4.
 
 ## What it does
 
-When the plugin is enabled and the embedded server is started, it:
+When the plugin is enabled and configured, it:
 
-1. Reads the xpub of your currently-open Electrum wallet.
-2. Imports the corresponding receive + change descriptors into Bitcoin
-   Core as a watch-only wallet (using `importdescriptors` with a default
-   range of 1000 addresses per branch).
-3. Spawns a local TLS Electrum-protocol server on `127.0.0.1:60002` that
-   answers all wallet-level RPCs (`blockchain.scripthash.*`,
-   `blockchain.transaction.*`, header subscriptions, broadcast, etc.)
-   directly from your node.
-4. Bookmarks itself in Electrum's Network preferences so you can
-   `Manual server selection` → choose `127.0.0.1:60002`.
-
-The result: Electrum never talks to any third-party server. Privacy and
-verification come from your own full node.
+1. Spawns a local TLS Electrum-protocol server on `127.0.0.1:50002`,
+   answering wallet RPCs (`blockchain.scripthash.*`,
+   `blockchain.scriptpubkey.*`, `blockchain.transaction.*`, header
+   subscriptions, broadcast, fee estimation, etc.) directly from your
+   node.
+2. Makes Bitcoin Core watch your wallet's scripts:
+   - **Electrum protocol 1.7** (preferred): as the wallet subscribes to
+     scriptPubKeys, the plugin imports each one into Core **on demand**.
+     This works for arbitrary addresses, including multisig and
+     hardware-wallet wallets, with no xpub required.
+   - **Protocol ≤ 1.6** (fallback): resolves the wallet's known
+     addresses via a scripthash → address table. Arbitrary addresses
+     outside that set cannot be resolved (a one-way-hash limitation of
+     the older protocol).
+3. Optionally **bulk-imports** your wallet's descriptors and triggers a
+   Core rescan, to surface *historical* transactions. Single-signature
+   (`wpkh` / `sh(wpkh)` / `pkh`) and multisig (`wsh`/`sh(wsh)`/`sh` of
+   `sortedmulti`) wallets are supported, via `importdescriptors`
+   (Core ≥ 0.21) with `importmulti` fallback for single-sig.
+4. Auto-configures Electrum to use the embedded server (`oneserver` plus
+   a server bookmark), so Electrum never talks to any third-party server.
 
 ## Repository layout
 
@@ -33,41 +41,58 @@ electrum-eps-plugin/
 │   ├── manifest.json       Plugin metadata
 │   ├── __init__.py         Config key declarations
 │   ├── qt.py               BasePlugin subclass, settings UI, server lifecycle
-│   ├── rpc.py              Synchronous Bitcoin Core JSON-RPC 2.0 client
-│   ├── addresses.py        BIP32 derivation + importdescriptors/importmulti
+│   ├── rpc.py              Synchronous Core JSON-RPC client + cookie auth
+│   ├── addresses.py        Descriptor building, on-demand ScriptWatcher, bulk import
 │   ├── server.py           Electrum protocol TCP+TLS server
 │   └── tls.py              Self-signed certificate generation
-├── tests/                  pytest unit tests (no Electrum dependency required)
+├── tests/                  unittest suite (no Electrum install required)
 └── .github/workflows/
     └── release.yml         Builds eps-X.Y.Z.zip on tag push
 ```
 
 ### Threading model
 
-| Thread                  | Purpose                                            |
-| ----------------------- | -------------------------------------------------- |
-| Main Qt thread          | GUI, config reads/writes                           |
-| `eps-server-main`       | `socket.accept()` loop                             |
-| `eps-client-<peer>`     | One per connected Electrum client                  |
-| `eps-notifier`          | Polls Core every 10 s, pushes header notifications |
-| `ImportWorker` (QThread)| Address import + rescan, reports progress to Qt    |
+| Thread                  | Purpose                                                  |
+| ----------------------- | -------------------------------------------------------- |
+| Main Qt thread          | GUI, config reads/writes                                 |
+| `eps-server-main`       | `socket.accept()` loop                                   |
+| `eps-client-<peer>`     | One per connected Electrum client                        |
+| `eps-notifier`          | Polls Core every 10 s; pushes header + script-status pushes |
+| `ImportWorker` (QThread)| Bulk address import + rescan, reports progress to Qt     |
 
 All Bitcoin Core RPC calls are synchronous (blocking). Each client has
 its own thread; EPS is single-user by design. Status updates from
 background threads to the GUI are marshalled through a Qt signal
-(`_StatusBridge`) so the GUI label is only ever touched on the Qt thread.
+(`_StatusBridge`) so GUI widgets are only ever touched on the Qt thread.
 
 ## Bitcoin Core setup
 
-`bitcoin.conf`:
-```
-server=1
-rpcuser=eps
-rpcpassword=eps          # use something secure outside testing
+The plugin needs RPC access to a Bitcoin Core node and a dedicated
+watch-only descriptor wallet to import addresses into.
 
-```
+### Authentication
 
-Create a dedicated watch-only descriptor wallet (Bitcoin Core ≥ 25):
+Either method works (configured in **Wallet → EPS Settings**):
+
+- **Static credentials** — set them in `bitcoin.conf` and enter them in
+  the **RPC Auth** field as `user:password`:
+
+  ```
+  server=1
+  rpcuser=eps
+  rpcpassword=eps          # use something secure outside testing
+  ```
+
+- **Cookie auth** — leave **RPC Auth** blank and set the **Directory**
+  field to your Core datadir; the plugin reads `<datadir>/<network>/.cookie`.
+
+  Note: if `rpcuser`/`rpcpassword` are present in `bitcoin.conf`, Core
+  does **not** write a `.cookie` file, so cookie auth is unavailable —
+  use the static credentials in that case. The cookie is also only
+  readable by the user Core runs as.
+
+### Watch-only wallet (Bitcoin Core ≥ 25)
+
 ```bash
 bitcoin-cli -testnet4 createwallet eps-test true true "" false true true
 #                                           ^disable_private_keys
@@ -78,9 +103,11 @@ bitcoin-cli -testnet4 createwallet eps-test true true "" false true true
 #                                                                  ^load_on_startup
 ```
 
-The plugin will populate this wallet via `importdescriptors` when you
-click **Import addresses from open wallet**. Expect the first rescan to
-take minutes (testnet4) to hours (mainnet, pruned ok).
+Enter this wallet's name in the **Wallet** field. The plugin imports
+into it on demand (protocol 1.7) and when you click **Import addresses
+from open wallet**. Expect the first rescan to take minutes (testnet4)
+to hours (mainnet; pruned nodes are supported but only scan non-pruned
+history).
 
 ## Installing the plugin (end users)
 
@@ -117,36 +144,50 @@ cd ~/repos/electrum-eps-plugin && \
 
 ## Usage flow
 
-1. Configure Bitcoin Core RPC credentials in **Wallet → EPS Settings**.
-2. Click **Import addresses from open wallet** (first time only per
-   wallet; subsequent opens are instant).
-3. Click **Start**.
-4. **Network → Manual server selection → `127.0.0.1:60002`**.
+1. Open **Wallet → EPS Settings** and enter your Bitcoin Core RPC URL,
+   authentication (RPC Auth *or* a datadir for cookie auth), and the
+   watch-only wallet name.
+2. Click **Save & Connect**. The plugin starts the embedded server and
+   automatically points Electrum at `127.0.0.1:50002`.
+3. (First time per wallet, optional) Click **Import addresses from open
+   wallet** to bulk-import descriptors and rescan for historical
+   transactions. New activity is picked up automatically without this.
+4. On subsequent wallet opens the server starts automatically (when RPC
+   is configured).
 
-The status label in the settings dialog turns green when an Electrum
-client connects.
+The status label in the settings dialog reports connection state and the
+embedded server's address.
 
 ## Limitations / TODO
 
-- History lookup is `O(mempool size)` per `blockchain.scripthash.get_history`
-  call. Acceptable on a personal-server scale, but a per-address
-  incremental mempool index updated by the notifier thread would scale
-  better on mainnet.
-- No push notifications on `blockchain.scripthash.subscribe`: when a
-  new mempool tx arrives, Electrum only learns about it on the next
-  block header notification (every ~10 s) or on user-triggered refresh.
-- Only one Electrum client at a time is the design assumption (multiple
-  clients work, but no per-client deduplication of work).
+- **Historical sync still needs the bulk import + rescan.** On-demand
+  (1.7) watching imports scripts with `timestamp: now`, so it only
+  guarantees *future* activity; past transactions appear after the
+  bulk-import rescan. A managed "rescan since date" that makes the xpub
+  bulk import fully optional is planned.
+- History lookup is `O(mempool size)` per `get_history` call. Fine at
+  personal-server scale; a per-address incremental index would scale
+  better on a busy mainnet node.
+- Protocol ≤ 1.6 clients can only be served for the wallet's *known*
+  addresses (scripthashes can't be reversed); arbitrary-address support
+  requires a 1.7 client.
+- One Electrum client at a time is the design assumption (multiple work,
+  but there is no per-client deduplication of work).
 - Lightning is not supported.
 
 ## Running tests
 
 ```bash
-pip install pytest
-pytest tests/
+python3 -m unittest discover -s tests -v
 ```
 
-Tests mock the `electrum` package, so you don't need an Electrum
+or, if you prefer pytest:
+
+```bash
+pip install pytest && pytest tests/
+```
+
+Tests stub the `electrum` package, so you don't need an Electrum
 checkout to run them.
 
 ## License
