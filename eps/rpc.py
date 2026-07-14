@@ -70,11 +70,14 @@ class BitcoinRPC:
     # Core call machinery
     # ------------------------------------------------------------------
 
-    def call(self, method: str, *params) -> Any:
+    def call(self, method: str, *params, timeout: float = 30) -> Any:
         """
         Make a single RPC call and return the 'result' field.
         Raises RPCError on a JSON-RPC error, or urllib.error.URLError
         on a network / auth failure.
+
+        `timeout=None` blocks until Core answers (needed for long-running
+        calls such as rescanblockchain).
         """
         self._id += 1
         payload = json.dumps({
@@ -87,7 +90,7 @@ class BitcoinRPC:
         req = urllib.request.Request(self._url, data=payload,
                                      headers=self._headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             # Bitcoin Core returns HTTP 500 with a JSON body on RPC errors.
@@ -164,4 +167,5 @@ class BitcoinRPC:
         return self.call("getaddressinfo", address)
 
     def rescanblockchain(self, start_height: int = 0) -> dict:
-        return self.call("rescanblockchain", start_height)
+        # Blocks until the rescan finishes — hours on mainnet — so no timeout.
+        return self.call("rescanblockchain", start_height, timeout=None)

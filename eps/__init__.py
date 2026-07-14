@@ -7,6 +7,8 @@
 #   eps_rpc_pass        – RPC password
 #   eps_rpc_wallet      – optional named Core wallet (default: '')
 #   eps_rpc_datadir     – Bitcoin Core datadir (cookie auth; optional)
+#   eps_birth_date      – wallet birth date 'YYYY-MM-DD'; bounds the import
+#                         rescan (default: '' = scan whole chain)
 #
 # The EPS server always binds 127.0.0.1:50002 (see EPS_LISTEN_* in eps/qt.py);
 # the plugin auto-wires Electrum to it, so it is not user-configurable.

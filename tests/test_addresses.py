@@ -206,9 +206,23 @@ class TestMultisigImport(unittest.TestCase):
 
     def test_already_imported_returns_false(self):
         imp = self._importer(
-            import_result=[{"success": False, "error": {"code": -4}}])
+            import_result=[{"success": False, "error": {
+                "code": -4, "message": "Descriptor already exists"}}])
         self.assertFalse(imp.import_wallet(self._Wallet()))
         self.assertEqual(len(self._requests(imp)), 2)
+
+    def test_other_wallet_error_minus4_raises(self):
+        # Core uses -4 for many failures, e.g. importing watch-only
+        # descriptors into a wallet with private keys. Must NOT be
+        # silently treated as 'already imported'.
+        from eps.rpc import RPCError
+        imp = self._importer(
+            import_result=[{"success": False, "error": {
+                "code": -4,
+                "message": "Cannot import descriptor without private keys "
+                           "to a wallet with private keys enabled"}}])
+        with self.assertRaises(RPCError):
+            imp.import_wallet(self._Wallet())
 
     def test_requires_core_021(self):
         imp = self._importer(version=200000)
@@ -252,6 +266,70 @@ class TestScriptWatcherDedup(unittest.TestCase):
         rpc.importdescriptors.assert_called_once()
         desc = rpc.importdescriptors.call_args[0][0][0]["desc"]
         self.assertTrue(desc.startswith("addr(tb1qexample2)"))
+
+
+class TestHeightForTimestamp(unittest.TestCase):
+    """Binary search of block header times for the rescan start height."""
+
+    GENESIS_TS = 1_600_000_000
+    SPACING = 600
+    TIP = 10_000
+
+    def _rpc(self):
+        rpc = MagicMock()
+        rpc.getblockcount.return_value = self.TIP
+        rpc.getblockhash.side_effect = lambda h: h  # identity: hash == height
+        rpc.getblockheader.side_effect = lambda h, verbose: {
+            "time": self.GENESIS_TS + h * self.SPACING}
+        return rpc
+
+    def test_target_before_genesis_returns_zero(self):
+        from eps.addresses import height_for_timestamp
+        self.assertEqual(
+            height_for_timestamp(self._rpc(), self.GENESIS_TS - 1), 0)
+
+    def test_target_after_tip_returns_near_tip(self):
+        from eps.addresses import height_for_timestamp
+        ts = self.GENESIS_TS + (self.TIP + 100) * self.SPACING
+        self.assertEqual(
+            height_for_timestamp(self._rpc(), ts), self.TIP - 144)
+
+    def test_finds_height_with_margin(self):
+        from eps.addresses import height_for_timestamp
+        target_height = 5_000
+        ts = self.GENESIS_TS + target_height * self.SPACING
+        self.assertEqual(
+            height_for_timestamp(self._rpc(), ts), target_height - 144)
+
+    def test_margin_clamped_at_zero(self):
+        from eps.addresses import height_for_timestamp
+        ts = self.GENESIS_TS + 10 * self.SPACING
+        self.assertEqual(height_for_timestamp(self._rpc(), ts), 0)
+
+
+class TestAlreadyImportedError(unittest.TestCase):
+
+    def test_matches_already_exists(self):
+        from eps.addresses import _is_already_imported_error
+        self.assertTrue(_is_already_imported_error(
+            -4, "Descriptor already exists in wallet"))
+
+    def test_matches_range_superset(self):
+        # Core rejects a re-import whose range is smaller than the existing
+        # one; everything we would import is already covered.
+        from eps.addresses import _is_already_imported_error
+        self.assertTrue(_is_already_imported_error(
+            -4, "new range must include current range = [0,1000]"))
+
+    def test_rejects_other_minus4_errors(self):
+        from eps.addresses import _is_already_imported_error
+        self.assertFalse(_is_already_imported_error(
+            -4, "Cannot import descriptor without private keys to a "
+                "wallet with private keys enabled"))
+
+    def test_rejects_other_codes(self):
+        from eps.addresses import _is_already_imported_error
+        self.assertFalse(_is_already_imported_error(-8, "already exists"))
 
 
 class TestMerkleBranch(unittest.TestCase):

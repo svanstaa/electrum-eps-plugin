@@ -103,8 +103,8 @@ bitcoin-cli -testnet4 createwallet eps-test true true "" false true true
 ```
 
 Enter this wallet's name in the **Wallet** field. The plugin imports
-into it on demand (protocol 1.7) and when you click **Import addresses
-from open wallet**. Expect the first rescan to take minutes (testnet4)
+into it on demand (protocol 1.7) and when you click **Import &
+rescan**. Expect the first rescan to take minutes (testnet4)
 to hours (mainnet; pruned nodes are supported but only scan non-pruned
 history).
 
@@ -148,9 +148,13 @@ cd ~/repos/electrum-eps-plugin && \
    watch-only wallet name.
 2. Click **Save & Connect**. The plugin starts the embedded server and
    automatically points Electrum at `127.0.0.1:50002`.
-3. (First time per wallet, optional) Click **Import addresses from open
-   wallet** to bulk-import descriptors and rescan for historical
-   transactions. New activity is picked up automatically without this.
+3. (First time per wallet, optional) Set the **Wallet birth date** —
+   the earliest possible first use of the wallet — then click
+   **Import & rescan** to bulk-import descriptors and rescan for
+   historical transactions. The rescan starts at the birth date's
+   block height, so a recent date turns hours (mainnet, full scan) into
+   minutes. Clicking again re-runs the rescan (e.g. after changing the
+   birth date). New activity is picked up automatically without this.
 4. On subsequent wallet opens the server starts automatically (when RPC
    is configured).
 
@@ -162,8 +166,9 @@ embedded server's address.
 - **Historical sync still needs the bulk import + rescan.** On-demand
   (1.7) watching imports scripts with `timestamp: now`, so it only
   guarantees *future* activity; past transactions appear after the
-  bulk-import rescan. A managed "rescan since date" that makes the xpub
-  bulk import fully optional is planned.
+  bulk-import rescan (bounded by the wallet birth date). A debounced
+  automatic rescan after on-demand imports — making the xpub bulk
+  import fully optional — is planned.
 - History lookup is `O(mempool size)` per `get_history` call. Fine at
   personal-server scale; a per-address incremental index would scale
   better on a busy mainnet node.

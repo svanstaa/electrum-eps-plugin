@@ -205,6 +205,54 @@ def add_descriptor_checksum(desc: str) -> str:
     return _descriptor_checksum(desc)
 
 
+def height_for_timestamp(rpc: "BitcoinRPC", target_ts: int,
+                         margin_blocks: int = 144) -> int:
+    """
+    Find the block height to start a rescan from so that all activity at or
+    after unix time `target_ts` is covered.
+
+    Binary-searches block header times, then backs off `margin_blocks`
+    (default ~1 day) because header timestamps are not strictly monotonic.
+    """
+    tip = rpc.getblockcount()
+
+    def _time(height: int) -> int:
+        return rpc.getblockheader(rpc.getblockhash(height), True)["time"]
+
+    if target_ts <= _time(0):
+        return 0
+    if _time(tip) < target_ts:
+        return max(0, tip - margin_blocks)
+
+    lo, hi = 0, tip  # _time(lo) < target_ts <= _time(hi)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if _time(mid) >= target_ts:
+            hi = mid
+        else:
+            lo = mid
+    return max(0, hi - margin_blocks)
+
+
+def _is_already_imported_error(code: int, message: str) -> bool:
+    """True only for Core's 'descriptor already exists' case.
+
+    Core uses code -4 (RPC_WALLET_ERROR) for many distinct failures, e.g.
+    'Cannot import descriptor without private keys to a wallet with private
+    keys enabled'. Treating every -4 as 'already imported' silently turned
+    such failures into a fake successful import, so match the message too.
+    """
+    if code != -4:
+        return False
+    msg = (message or "").lower()
+    if "already" in msg or "duplicate" in msg:
+        return True
+    # Descriptor exists with a wider range than we import (e.g. from an
+    # older plugin build): 'new range must include current range = [0,N]'.
+    # Everything we would add is already covered.
+    return "must include current range" in msg
+
+
 class ScriptWatcher:
     """
     Track output scripts in Bitcoin Core. Used for Electrum protocol 1.7
@@ -255,7 +303,8 @@ class ScriptWatcher:
             for r in results:
                 if not r.get("success"):
                     err = r.get("error", {})
-                    if err.get("code") == -4:
+                    if _is_already_imported_error(err.get("code", -1),
+                                                  err.get("message", "")):
                         break
                     raise RPCError(err.get("code", -1), err.get("message", "unknown"))
 
@@ -437,14 +486,14 @@ class AddressImporter:
             for r in results:
                 if not r.get("success"):
                     err = r.get("error", {})
-                    if err.get("code") == -4:
-                        # Already imported — not an error for us
+                    if _is_already_imported_error(err.get("code", -1),
+                                                  err.get("message", "")):
                         return False
                     raise RPCError(err.get("code", -1), err.get("message", "unknown"))
             return True
         except RPCError as e:
-            if e.code == -4:
-                return False  # already imported
+            if _is_already_imported_error(e.code, e.message):
+                return False
             raise
 
     def _import_via_importmulti(self, xpub: str, script_type: str,

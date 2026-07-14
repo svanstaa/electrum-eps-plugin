@@ -4,17 +4,20 @@
 # Manages the server lifecycle, settings UI, and wallet hooks.
 
 import logging
+import threading
+import time
+from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
 
 try:
     from PyQt6.QtWidgets import (
-        QFormLayout, QLabel,
+        QDateEdit, QFormLayout, QLabel,
         QLineEdit, QMessageBox, QProgressDialog, QPushButton,
         QTextEdit, QVBoxLayout,
     )
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QDate
     from PyQt6.QtGui import QTextOption
     _ECHO_PASSWORD = QLineEdit.EchoMode.Password
     _WINDOW_MODAL = Qt.WindowModality.WindowModal
@@ -22,16 +25,19 @@ try:
     _WRAP_ANYWHERE = QTextOption.WrapMode.WrapAnywhere
 except ImportError:
     from PyQt5.QtWidgets import (
-        QFormLayout, QLabel,
+        QDateEdit, QFormLayout, QLabel,
         QLineEdit, QMessageBox, QProgressDialog, QPushButton,
         QTextEdit, QVBoxLayout,
     )
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject, QDate
     from PyQt5.QtGui import QTextOption
     _ECHO_PASSWORD = QLineEdit.Password
     _WINDOW_MODAL = Qt.WindowModal
     _ALIGN_RIGHT_VCENTER = Qt.AlignRight | Qt.AlignVCenter
     _WRAP_ANYWHERE = QTextOption.WrapAnywhere
+
+# Bitcoin genesis day; a birth date of this value means "full rescan".
+_GENESIS_DATE = "2009-01-03"
 
 from electrum import constants
 from electrum.gui.qt.util import Buttons, CloseButton, WindowModalDialog
@@ -166,31 +172,68 @@ class ImportWorker(QObject):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, rpc, wallet):
+    def __init__(self, rpc, wallet, birth_date: str = ""):
         super().__init__()
         self.rpc = rpc
         self.wallet = wallet
+        self.birth_date = birth_date  # 'YYYY-MM-DD' or '' for full rescan
+
+    def _rescan_start_height(self) -> int:
+        if not self.birth_date or self.birth_date <= _GENESIS_DATE:
+            return 0
+        from .addresses import height_for_timestamp
+        ts = int(datetime.strptime(self.birth_date, "%Y-%m-%d")
+                 .replace(tzinfo=timezone.utc).timestamp())
+        return height_for_timestamp(self.rpc, ts)
+
+    def _run_rescan(self, start_height: int):
+        """Run rescanblockchain in a helper thread and poll Core for
+        progress, so the user sees percentages instead of a stuck dialog."""
+        error = []
+
+        def _rescan():
+            try:
+                self.rpc.rescanblockchain(start_height)
+            except Exception as e:
+                error.append(e)
+
+        t = threading.Thread(target=_rescan, daemon=True,
+                             name="eps-rescan")
+        t.start()
+        while t.is_alive():
+            time.sleep(2)
+            try:
+                scanning = self.rpc.getwalletinfo().get("scanning")
+            except Exception:
+                continue
+            if isinstance(scanning, dict):
+                pct = scanning.get("progress", 0) * 100
+                self.progress.emit(
+                    _("Rescanning… {:.1f}% (safe to leave running)")
+                    .format(pct))
+        if error:
+            raise error[0]
 
     def run(self):
         try:
             from .addresses import AddressImporter
             importer = AddressImporter(self.rpc)
-
             self.progress.emit(_("Importing addresses into Bitcoin Core…"))
             imported_new = importer.import_wallet(
                 self.wallet,
                 progress_cb=lambda msg: self.progress.emit(msg),
             )
-
-            if imported_new:
-                self.progress.emit(_("New addresses imported. Starting rescan… "
-                                     "(this may take a long time on first run)"))
-                self.rpc.rescanblockchain(0)
-                self.progress.emit(_("Rescan complete."))
-            else:
+            if not imported_new:
                 self.progress.emit(_("All addresses already imported."))
 
-            self.finished.emit(True, _("Import complete."))
+            # Always rescan: the button is an explicit user action, and this
+            # covers aborted rescans and birth-date changes without extra UI.
+            start_height = self._rescan_start_height()
+            self.progress.emit(
+                _("Rescanning from height {}…").format(start_height))
+            self._run_rescan(start_height)
+
+            self.finished.emit(True, _("Import & rescan complete."))
         except Exception as e:
             logger.exception("Import worker error")
             self.finished.emit(False, str(e))
@@ -529,10 +572,21 @@ class Plugin(BasePlugin):
 
         # --- Wallet import ---
         form.addRow(title(_('Wallet import')))
-        import_btn = QPushButton(_('Import addresses from open wallet'))
+
+        birth_e = QDateEdit()
+        birth_e.setCalendarPopup(True)
+        birth_e.setDisplayFormat("yyyy-MM-dd")
+        birth_e.setMinimumDate(QDate.fromString(_GENESIS_DATE, "yyyy-MM-dd"))
+        birth_e.setMaximumDate(QDate.currentDate())
+        birth_e.setDate(QDate.fromString(
+            self.config.get("eps_birth_date", _GENESIS_DATE), "yyyy-MM-dd"))
+        form.addRow(_('Wallet birth date:'), birth_e)
+
+        import_btn = QPushButton(_('Import && rescan'))
         form.addRow('', import_btn)
         form.addRow('', helptext(
-            _('Required once per wallet. Triggers a Core rescan on first import.'),
+            _('Once per wallet: imports its addresses into Core and rescans '
+              'from the birth date.'),
             False))
 
         # --- Status / log ---
@@ -562,6 +616,8 @@ class Plugin(BasePlugin):
             self.config.set_key("eps_rpc_pass", password)
             self.config.set_key("eps_rpc_datadir", dir_e.text().strip())
             self.config.set_key("eps_rpc_wallet", wallet_e.text().strip())
+            self.config.set_key("eps_birth_date",
+                                birth_e.date().toString("yyyy-MM-dd"))
 
         def _can_connect() -> bool:
             user, password = _parse_rpc_auth(auth_e.text())
@@ -591,8 +647,13 @@ class Plugin(BasePlugin):
         save_b.setDefault(True)
         save_b.clicked.connect(_save_and_connect)
 
-        import_btn.clicked.connect(
-            lambda: self.import_wallet_addresses(self._active_window, d))
+        def _on_import_clicked():
+            # Persist the birth date even if Save & Connect wasn't clicked.
+            self.config.set_key("eps_birth_date",
+                                birth_e.date().toString("yyyy-MM-dd"))
+            self.import_wallet_addresses(self._active_window, d)
+
+        import_btn.clicked.connect(_on_import_clicked)
 
         if not self._active_wallet:
             import_btn.setEnabled(False)
@@ -629,7 +690,8 @@ class Plugin(BasePlugin):
         dlg.show()
 
         self._import_thread = QThread()
-        self._import_worker = ImportWorker(rpc, wallet)
+        self._import_worker = ImportWorker(
+            rpc, wallet, birth_date=self.config.get("eps_birth_date", ""))
         self._import_worker.moveToThread(self._import_thread)
 
         def _on_progress(msg):
