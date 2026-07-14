@@ -523,7 +523,7 @@ class Plugin(BasePlugin):
 
     def _open_settings_dialog(self, window):
         d = WindowModalDialog(window, _('Connect to Bitcoin Core with EPS'))
-        d.setMinimumWidth(570)
+        d.setMinimumWidth(740)
         vbox = QVBoxLayout(d)
 
         warnings = []
@@ -561,13 +561,15 @@ class Plugin(BasePlugin):
         dir_e = input_field(self.config.get("eps_rpc_datadir", ""))
         form.addRow(_('Directory:'), dir_e)
         form.addRow('', helptext(
-            _('Bitcoin Core datadir (for cookie auth). Not used when RPC Auth is set.'),
+            _('Bitcoin Core datadir (for cookie auth). Not used when RPC '
+              'Auth is set.'),
             False))
 
         wallet_e = input_field(self.config.get("eps_rpc_wallet", ""), 150)
         form.addRow(_('Wallet:'), wallet_e)
         form.addRow('', helptext(
-            _('Optional named Core wallet (e.g. eps-test). Leave blank for default.'),
+            _('Watch-only Core wallet; required when Core has multiple '
+              'wallets loaded.'),
             False))
 
         # --- Wallet import ---
@@ -585,8 +587,8 @@ class Plugin(BasePlugin):
         import_btn = QPushButton(_('Import && rescan'))
         form.addRow('', import_btn)
         form.addRow('', helptext(
-            _('Once per wallet: imports its addresses into Core and rescans '
-              'from the birth date.'),
+            _('Imports the wallet addresses into Core and rescans from the '
+              'birth date.'),
             False))
 
         # --- Status / log ---
