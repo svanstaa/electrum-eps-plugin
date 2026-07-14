@@ -299,6 +299,13 @@ class ElectrumServer:
         try:
             result = handler(self, params, peer)
             return {"jsonrpc": "2.0", "id": req_id, "result": result}
+        except ElectrumServerError as e:
+            # Expected protocol-level failures (e.g. merkle proof requested
+            # for a tx that a reorg moved out of the block). Use code 1 like
+            # ElectrumX; -32603 would look like a server malfunction to the
+            # client and is treated as disconnect-worthy in some contexts.
+            logger.warning(f"{peer} -> {method}: {e}")
+            return self._error(req_id, 1, str(e))
         except RPCError as e:
             logger.warning(f"{peer} -> {method}: RPC error: {e}")
             return self._error(req_id, e.code, e.message)
