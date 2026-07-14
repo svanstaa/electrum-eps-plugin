@@ -97,6 +97,111 @@ def _merkle_branch(txids: List[str], pos: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Mempool index
+# ---------------------------------------------------------------------------
+
+class MempoolIndex:
+    """
+    Incremental index of *unconfirmed wallet transactions*, keyed by the
+    scriptPubKeys they touch (all outputs plus all spent prevouts).
+
+    Every script a client queries is imported into the Core wallet first
+    (ScriptWatcher.ensure_watched), so any mempool tx that can affect a
+    subscribed script is a wallet transaction and appears in listsinceblock
+    with confirmations <= 0. Indexing only those keeps each refresh
+    O(own unconfirmed txs); the previous full-mempool walk was O(mempool)
+    getrawtransaction calls *per query* — minutes per startup on mainnet.
+
+    Known limitation (shared with the original EPS): a tx that was already
+    in the mempool before its script was imported into the wallet is not
+    seen until it confirms.
+    """
+
+    TTL = 2.0  # seconds; one refresh serves a whole burst of subscriptions
+
+    def __init__(self, rpc: BitcoinRPC):
+        self.rpc = rpc
+        self._lock = threading.Lock()
+        self._last_refresh = 0.0
+        self._txid_to_spks: Dict[str, set] = {}
+        self._spk_to_txids: Dict[str, set] = {}
+
+    def txids_for_spk(self, spk_hex: str) -> set:
+        """Unconfirmed wallet txids touching `spk_hex` (refreshes if stale)."""
+        spk_hex = spk_hex.lower()
+        with self._lock:
+            self._maybe_refresh()
+            return set(self._spk_to_txids.get(spk_hex, ()))
+
+    def _maybe_refresh(self):
+        now = time.monotonic()
+        if now - self._last_refresh < self.TTL:
+            return
+        self._last_refresh = now
+        try:
+            result = self.rpc.call("listsinceblock", "", 1, True, True)
+        except RPCError as e:
+            logger.debug(f"mempool index: listsinceblock failed: {e}")
+            return
+        current = {tx["txid"] for tx in result.get("transactions", [])
+                   if tx.get("confirmations", 1) <= 0}
+
+        # Evict txs that confirmed or dropped out of the mempool.
+        for txid in set(self._txid_to_spks) - current:
+            for spk in self._txid_to_spks.pop(txid):
+                txids = self._spk_to_txids.get(spk)
+                if txids is not None:
+                    txids.discard(txid)
+                    if not txids:
+                        del self._spk_to_txids[spk]
+
+        for txid in current - set(self._txid_to_spks):
+            spks = self._spks_touched(txid)
+            self._txid_to_spks[txid] = spks
+            for spk in spks:
+                self._spk_to_txids.setdefault(spk, set()).add(txid)
+
+    def _spks_touched(self, txid: str) -> set:
+        try:
+            tx = self.rpc.getrawtransaction(txid, True)
+        except RPCError:
+            return set()
+        spks = set()
+        for vout in tx.get("vout", []):
+            spk = vout.get("scriptPubKey", {}).get("hex", "")
+            if spk:
+                spks.add(spk.lower())
+        for vin in tx.get("vin", []):
+            prev_txid = vin.get("txid")
+            prev_n = vin.get("vout")
+            if prev_txid is None or prev_n is None:
+                continue   # coinbase
+            spk = self._prevout_spk(prev_txid, prev_n)
+            if spk:
+                spks.add(spk)
+        return spks
+
+    def _prevout_spk(self, prev_txid: str, prev_n: int) -> Optional[str]:
+        # Confirmed prevouts are in the UTXO set (include_mempool=False so
+        # the pending spend doesn't hide them) — works without txindex.
+        try:
+            txout = self.rpc.call("gettxout", prev_txid, prev_n, False)
+        except RPCError:
+            txout = None
+        if txout:
+            spk = txout.get("scriptPubKey", {}).get("hex", "").lower()
+            if spk:
+                return spk
+        # Unconfirmed parent (or a txindex node): fall back to the raw tx.
+        try:
+            prev = self.rpc.getrawtransaction(prev_txid, True)
+            spk = prev["vout"][prev_n].get("scriptPubKey", {}).get("hex", "")
+            return spk.lower() or None
+        except (RPCError, KeyError, IndexError):
+            return None
+
+
+# ---------------------------------------------------------------------------
 # Subscription state per-client
 # ---------------------------------------------------------------------------
 
@@ -146,6 +251,7 @@ class ElectrumServer:
         self._clients_lock = threading.Lock()
 
         self._script_watcher = ScriptWatcher(rpc)
+        self._mempool_index = MempoolIndex(rpc)
 
         # Last pushed subscription status (spk hex -> status or None)
         self._status_cache: Dict[str, Optional[str]] = {}
@@ -606,13 +712,9 @@ class ElectrumServer:
 
           1. listunspent (per-address) — gives us txids of unspent receives.
           2. listsinceblock — confirmed wallet activity (sends and receives).
-          3. getrawmempool walk — catches mempool sends that
-             listtransactions/listsinceblock miss for watch-only descriptor
-             wallets when both inputs and outputs are within watched ranges.
-
-        NOTE: This is O(mempool size) per query. Fine for a personal server
-        on testnet; for mainnet under load we should maintain an incremental
-        per-address tx index updated on each new block / mempool poll.
+          3. MempoolIndex — attributes unconfirmed wallet txs (notably sends,
+             which listsinceblock reports under the *destination* address)
+             to the scripts their inputs/outputs touch.
         """
         seen: Dict[str, int] = {}  # txid -> height (0 = mempool)
 
@@ -635,15 +737,9 @@ class ElectrumServer:
             except RPCError as e:
                 logger.debug(f"listsinceblock failed: {e}")
 
-        try:
-            mempool = self.rpc.call("getrawmempool")
-        except RPCError:
-            mempool = []
-        for txid in mempool:
-            if txid in seen:
-                continue
-            if self._tx_touches_script(txid, address, spk_hex):
-                seen[txid] = 0
+        if spk_hex:
+            for txid in self._mempool_index.txids_for_spk(spk_hex):
+                seen.setdefault(txid, 0)
 
         # Electrum protocol requires:
         #   - confirmed entries first, in ascending height order
@@ -755,70 +851,6 @@ class ElectrumServer:
             return script.lower() == spk_hex
         except (RPCError, KeyError, IndexError):
             return False
-
-    def _tx_touches_script(self, txid: str, address: Optional[str],
-                           spk_hex: Optional[str]) -> bool:
-        if address and self._tx_touches_address(txid, address):
-            return True
-        if not spk_hex:
-            return False
-        spk_hex = spk_hex.lower()
-        try:
-            tx = self.rpc.getrawtransaction(txid, True)
-        except RPCError:
-            return False
-        for vout in tx.get("vout", []):
-            if vout.get("scriptPubKey", {}).get("hex", "").lower() == spk_hex:
-                return True
-        for vin in tx.get("vin", []):
-            prev_txid = vin.get("txid")
-            prev_n = vin.get("vout")
-            if prev_txid is None or prev_n is None:
-                continue
-            try:
-                prev = self.rpc.getrawtransaction(prev_txid, True)
-                prev_out = prev["vout"][prev_n]
-            except (RPCError, KeyError, IndexError):
-                continue
-            if prev_out.get("scriptPubKey", {}).get("hex", "").lower() == spk_hex:
-                return True
-        return False
-
-    def _tx_touches_address(self, txid: str, address: str) -> bool:
-        """True if `address` appears in any output or in any spent prevout
-        of `txid`. Used for the mempool fallback in _get_history."""
-        try:
-            tx = self.rpc.getrawtransaction(txid, True)
-        except RPCError:
-            return False
-        for vout in tx.get("vout", []):
-            if self._vout_address(vout) == address:
-                return True
-        for vin in tx.get("vin", []):
-            prev_txid = vin.get("txid")
-            prev_n = vin.get("vout")
-            if prev_txid is None or prev_n is None:
-                continue
-            try:
-                prev = self.rpc.getrawtransaction(prev_txid, True)
-            except RPCError:
-                continue
-            try:
-                prev_out = prev["vout"][prev_n]
-            except (KeyError, IndexError):
-                continue
-            if self._vout_address(prev_out) == address:
-                return True
-        return False
-
-    @staticmethod
-    def _vout_address(vout: dict) -> Optional[str]:
-        spk = vout.get("scriptPubKey", {})
-        addr = spk.get("address")
-        if addr:
-            return addr
-        addrs = spk.get("addresses") or []
-        return addrs[0] if addrs else None
 
     def _history_status(self, history: List[dict]) -> Optional[str]:
         if not history:
