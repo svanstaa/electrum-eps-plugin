@@ -421,7 +421,8 @@ class ElectrumServer:
     def _method_blockchain_scriptpubkey_get_history(self, params, peer):
         spk_hex = params[0].lower().strip()
         self._script_watcher.ensure_watched(spk_hex)
-        return self._get_history(spk_hex=spk_hex)
+        # Finalized protocol 1.7 wraps the list in a dict (electrum-protocol PR #17).
+        return {"history": self._get_history(spk_hex=spk_hex)}
 
     def _method_blockchain_scriptpubkey_get_balance(self, params, peer):
         spk_hex = params[0].lower().strip()
@@ -431,13 +432,22 @@ class ElectrumServer:
     def _method_blockchain_scriptpubkey_listunspent(self, params, peer):
         spk_hex = params[0].lower().strip()
         self._script_watcher.ensure_watched(spk_hex)
-        return self._listunspent(spk_hex=spk_hex)
+        # Finalized protocol 1.7 wraps the list in a dict (electrum-protocol PR #17).
+        return {"utxos": self._listunspent(spk_hex=spk_hex)}
 
     def _method_blockchain_outpoint_subscribe(self, params, peer):
         if len(params) < 2:
             raise ElectrumServerError("txid and vout required")
         txid = params[0]
         vout = int(params[1])
+        # Finalized 1.7: client always sends the outpoint's scriptPubKey as a
+        # third param. Import it so Core tracks the output even if we've never
+        # seen its address before (needed for gettxout on foreign outpoints).
+        if len(params) > 2 and params[2]:
+            try:
+                self._script_watcher.ensure_watched(str(params[2]).lower().strip())
+            except Exception as e:
+                logger.debug(f"outpoint.subscribe: spk_hint import failed: {e}")
         t = threading.current_thread()
         with self._clients_lock:
             entry = self._clients.get(t)
@@ -882,7 +892,8 @@ class ElectrumServer:
         if txout:
             confs = txout.get("confirmations", 0)
             height = self._height_from_confs(confs) if confs else 0
-            return {"height": height}
+            # Finalized 1.7 renamed this field from "height" to "funder_height".
+            return {"funder_height": height}
 
         try:
             results = self.rpc.call(
@@ -992,8 +1003,10 @@ class ElectrumServer:
                         pass
 
         # --- scriptpubkey subscriptions (protocol >= 1.7) ---
-        # The client matches notifications by the scriptPubKey it subscribed
-        # with, so the identifier here MUST be the spk hex (not its scripthash).
+        # Finalized 1.7: the client matches notifications by the *scripthash*
+        # of the scriptPubKey it subscribed with (interface.py converts
+        # spk -> sh for the notification key), so the identifier here MUST be
+        # scripthash(spk), not the spk hex itself.
         watched_spk: set = set()
         for _conn, state in clients:
             watched_spk.update(state.scriptpubkey_subs)
@@ -1008,7 +1021,7 @@ class ElectrumServer:
             notif = json.dumps({
                 "jsonrpc": "2.0",
                 "method": "blockchain.scriptpubkey.subscribe",
-                "params": [spk, status],
+                "params": [scriptpubkey_to_scripthash(spk), status],
             }).encode() + b"\n"
 
             for conn, state in clients:

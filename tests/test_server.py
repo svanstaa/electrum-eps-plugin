@@ -204,6 +204,46 @@ class TestScriptPubKey(unittest.TestCase):
         mock_bal.assert_called_once_with(spk_hex=self.spk)
         self.assertEqual(resp["result"]["confirmed"], 1)
 
+    def test_scriptpubkey_get_history_wrapped_in_dict(self):
+        # Finalized 1.7 wraps the history list in {"history": [...]}.
+        self.server._script_watcher.ensure_watched = MagicMock()
+        hist = [{"tx_hash": "aa" * 32, "height": 5}]
+        with patch.object(self.server, "_get_history", return_value=hist):
+            resp = self.server._dispatch(
+                {"id": 1, "method": "blockchain.scriptpubkey.get_history",
+                 "params": [self.spk]},
+                "peer",
+            )
+        self.assertEqual(resp["result"], {"history": hist})
+
+    def test_scriptpubkey_listunspent_wrapped_in_dict(self):
+        # Finalized 1.7 wraps the utxo list in {"utxos": [...]}.
+        self.server._script_watcher.ensure_watched = MagicMock()
+        utxos = [{"tx_hash": "bb" * 32, "tx_pos": 0, "height": 5, "value": 1000}]
+        with patch.object(self.server, "_listunspent", return_value=utxos):
+            resp = self.server._dispatch(
+                {"id": 1, "method": "blockchain.scriptpubkey.listunspent",
+                 "params": [self.spk]},
+                "peer",
+            )
+        self.assertEqual(resp["result"], {"utxos": utxos})
+
+    def test_outpoint_subscribe_funder_height_and_spk_hint(self):
+        # Finalized 1.7: status field is "funder_height" (renamed from
+        # "height"), and the client always sends an spk_hint third param
+        # which the server should import.
+        self.server._script_watcher.ensure_watched = MagicMock()
+        self.server.rpc.call = MagicMock(return_value={"confirmations": 3})
+        self.server._tip_height = 100
+        resp = self.server._dispatch(
+            {"id": 1, "method": "blockchain.outpoint.subscribe",
+             "params": ["cc" * 32, 0, self.spk]},
+            "peer",
+        )
+        self.server._script_watcher.ensure_watched.assert_called_once_with(self.spk)
+        self.assertEqual(resp["result"], {"funder_height": 98})
+        self.assertNotIn("height", resp["result"])
+
 
 class TestBlockHeaders(unittest.TestCase):
 
@@ -254,8 +294,9 @@ class TestBlockHeaders(unittest.TestCase):
 
 
 class TestPushScriptNotifications(unittest.TestCase):
-    """H1 regression: each subscription type must be notified with the
-    identifier the client subscribed with (scripthash vs scriptPubKey)."""
+    """Notification identifiers per finalized protocol 1.7:
+    scripthash subs are keyed by scripthash; scriptpubkey subs are keyed by
+    scripthash(spk) — Electrum's interface converts spk -> sh for matching."""
 
     def setUp(self):
         self.server = _make_server()
@@ -268,7 +309,7 @@ class TestPushScriptNotifications(unittest.TestCase):
         return [json.loads(call[0][0].decode())
                 for call in conn.sendall.call_args_list]
 
-    def test_scriptpubkey_notification_uses_spk_identifier(self):
+    def test_scriptpubkey_notification_uses_scripthash_of_spk(self):
         spk = "76a914" + "11" * 20 + "88ac"
         conn = MagicMock()
         state = ClientState()
@@ -280,8 +321,10 @@ class TestPushScriptNotifications(unittest.TestCase):
         msgs = self._sent(conn)
         self.assertEqual(len(msgs), 1)
         self.assertEqual(msgs[0]["method"], "blockchain.scriptpubkey.subscribe")
-        # The identifier must be the spk hex, NOT its scripthash.
-        self.assertEqual(msgs[0]["params"][0], spk)
+        # Finalized 1.7: the identifier is scripthash(spk), not the spk hex.
+        from eps.addresses import scriptpubkey_to_scripthash
+        self.assertEqual(msgs[0]["params"][0], scriptpubkey_to_scripthash(spk))
+        self.assertNotEqual(msgs[0]["params"][0], spk)
 
     def test_scripthash_notification_uses_scripthash_identifier(self):
         sh = "ab" * 32
