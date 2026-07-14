@@ -216,17 +216,6 @@ class ScriptWatcher:
         self._lock = threading.Lock()
         self._imported_spks: set = set()
         self._spk_to_address: Dict[str, Optional[str]] = {}
-        self._sh_to_spk: Dict[str, str] = {}
-
-    def register_address(self, address: str) -> None:
-        script = bitcoin.address_to_script(address)
-        if isinstance(script, str):
-            script = bytes.fromhex(script)
-        spk_hex = script.hex()
-        sh = scriptpubkey_to_scripthash(script)
-        with self._lock:
-            self._spk_to_address[spk_hex] = address
-            self._sh_to_spk[sh] = spk_hex
 
     def address_for_spk(self, spk_hex: str) -> Optional[str]:
         with self._lock:
@@ -270,11 +259,9 @@ class ScriptWatcher:
                         break
                     raise RPCError(err.get("code", -1), err.get("message", "unknown"))
 
-        sh = scriptpubkey_to_scripthash(script)
         with self._lock:
             self._imported_spks.add(spk_hex)
             self._spk_to_address.setdefault(spk_hex, address)
-            self._sh_to_spk[sh] = spk_hex
 
     def _core_already_watches(self, address: str) -> bool:
         """True if a wallet descriptor in Core already covers `address`, so an
@@ -284,18 +271,6 @@ class ScriptWatcher:
         except RPCError:
             return False
         return bool(info.get("ismine") or info.get("iswatchonly"))
-
-    def address_for_scripthash(self, scripthash: str) -> Optional[str]:
-        spk_hex = self._sh_to_spk.get(scripthash)
-        if spk_hex is None:
-            return None
-        return self._spk_to_address.get(spk_hex)
-
-    def script_for_scripthash(self, scripthash: str) -> Optional[bytes]:
-        spk_hex = self._sh_to_spk.get(scripthash)
-        if spk_hex is None:
-            return None
-        return bytes.fromhex(spk_hex)
 
 
 # ---------------------------------------------------------------------------

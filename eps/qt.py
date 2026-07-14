@@ -248,7 +248,6 @@ class Plugin(BasePlugin):
             if not self.start_server():
                 return
             return
-        self._register_wallet_addresses(wallet)
         self._bookmark_eps_server(add=True)
         if self._prev_network_settings is not None:
             self._auto_configure_network()
@@ -339,9 +338,6 @@ class Plugin(BasePlugin):
         self._auto_configure_network()
 
         self._set_status(f"Running on {EPS_LISTEN_HOST}:{EPS_LISTEN_PORT}")
-
-        if self._active_wallet:
-            self._register_wallet_addresses(self._active_wallet)
 
         return True
 
@@ -448,17 +444,6 @@ class Plugin(BasePlugin):
             logger.info(f"{'Bookmarked' if add else 'Unbookmarked'} {server}")
         except Exception as e:
             logger.warning(f"Bookmark op failed: {e}")
-
-    def _register_wallet_addresses(self, wallet):
-        if not self._server:
-            return
-        addrs = list(wallet.get_addresses())
-        for addr in addrs:
-            self._server.register_address(addr)
-        logger.info(
-            f"EPS now tracking {len(self._server._scripthash_cache)} addresses "
-            f"({len(addrs)} from {getattr(wallet, 'basename', lambda: '?')()})"
-        )
 
     def _log(self, level: str, msg: str, *, pkg: str = "eps"):
         logger.log(getattr(logging, level, logging.INFO), msg)

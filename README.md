@@ -12,19 +12,18 @@ Core 30 on testnet4.
 When the plugin is enabled and configured, it:
 
 1. Spawns a local TLS Electrum-protocol server on `127.0.0.1:50002`,
-   answering wallet RPCs (`blockchain.scripthash.*`,
-   `blockchain.scriptpubkey.*`, `blockchain.transaction.*`, header
+   answering wallet RPCs (`blockchain.scriptpubkey.*`,
+   `blockchain.outpoint.subscribe`, `blockchain.transaction.*`, header
    subscriptions, broadcast, fee estimation, etc.) directly from your
-   node.
-2. Makes Bitcoin Core watch your wallet's scripts:
-   - **Electrum protocol 1.7** (preferred): as the wallet subscribes to
-     scriptPubKeys, the plugin imports each one into Core **on demand**.
-     This works for arbitrary addresses, including multisig and
-     hardware-wallet wallets, with no xpub required.
-   - **Protocol ≤ 1.6** (fallback): resolves the wallet's known
-     addresses via a scripthash → address table. Arbitrary addresses
-     outside that set cannot be resolved (a one-way-hash limitation of
-     the older protocol).
+   node. The server speaks **Electrum protocol 1.7 only**: clients send
+   scriptPubKeys directly, so the server needs no knowledge of the
+   wallet. (Protocol ≤ 1.6 queries by scripthash — a one-way hash that
+   would require pre-registering wallet addresses — and is not
+   supported; released Electrum ≤ 4.8 cannot connect.)
+2. Makes Bitcoin Core watch your wallet's scripts **on demand**: as the
+   wallet subscribes to scriptPubKeys, the plugin imports each one into
+   Core. This works for arbitrary addresses, including multisig and
+   hardware-wallet wallets, with no xpub required.
 3. Optionally **bulk-imports** your wallet's descriptors and triggers a
    Core rescan, to surface *historical* transactions. Single-signature
    (`wpkh` / `sh(wpkh)` / `pkh`) and multisig (`wsh`/`sh(wsh)`/`sh` of
@@ -168,9 +167,9 @@ embedded server's address.
 - History lookup is `O(mempool size)` per `get_history` call. Fine at
   personal-server scale; a per-address incremental index would scale
   better on a busy mainnet node.
-- Protocol ≤ 1.6 clients can only be served for the wallet's *known*
-  addresses (scripthashes can't be reversed); arbitrary-address support
-  requires a 1.7 client.
+- Requires a protocol 1.7 client (Electrum's `protocol_1.7` branch, or
+  any release that ships 1.7). Released Electrum ≤ 4.8 speaks 1.4–1.6
+  only and cannot connect.
 - One Electrum client at a time is the design assumption (multiple work,
   but there is no per-client deduplication of work).
 - Lightning is not supported.

@@ -27,20 +27,6 @@ def _make_server() -> ElectrumServer:
     return ElectrumServer(rpc, host="127.0.0.1", port=50002)
 
 
-class TestScripthashCache(unittest.TestCase):
-    """Verify the cache is per-instance, not class-level."""
-
-    def test_separate_instances_have_separate_caches(self):
-        s1 = _make_server()
-        s2 = _make_server()
-        # Patch address_to_scripthash to return a known value
-        with patch("eps.server.address_to_scripthash", return_value="aabb"), \
-             patch("eps.addresses.ScriptWatcher.register_address"):
-            s1.register_address("bc1qfoo")
-        self.assertIn("aabb", s1._scripthash_cache)
-        self.assertNotIn("aabb", s2._scripthash_cache)
-
-
 class TestDispatch(unittest.TestCase):
 
     def setUp(self):
@@ -55,21 +41,13 @@ class TestDispatch(unittest.TestCase):
         self.assertIn("error", resp)
         self.assertEqual(resp["error"]["code"], -32601)
 
-    def test_server_ping(self):
+    def test_server_ping_no_params(self):
         resp = self._dispatch("server.ping")
-        self.assertIn("result", resp)
-        self.assertIsNone(resp["result"])
+        self.assertEqual(resp["result"], {"data": ""})
 
-    def test_server_ping_17(self):
-        state = ClientState()
-        state.protocol_version = "1.7"
-        t = threading.current_thread()
-        self.server._clients[t] = (MagicMock(), state)
-        try:
-            resp = self._dispatch("server.ping", [32, "aa"])
-            self.assertEqual(resp["result"], {"data": "0" * 32})
-        finally:
-            self.server._clients.pop(t, None)
+    def test_server_ping_pong_len(self):
+        resp = self._dispatch("server.ping", [32, "aa"])
+        self.assertEqual(resp["result"], {"data": "0" * 32})
 
     def test_server_features_protocol_range(self):
         self.server.rpc.getblockhash.return_value = "00" * 32
@@ -78,15 +56,24 @@ class TestDispatch(unittest.TestCase):
         self.assertEqual(resp["result"]["protocol_max"], PROTOCOL_VERSION_MAX)
 
     def test_protocol_negotiation(self):
+        # 1.7-only server: older clients cannot negotiate a session.
+        from eps.server import ElectrumServerError
         self.assertEqual(_negotiate_protocol(["1.7", "1.7"]), "1.7")
-        self.assertEqual(_negotiate_protocol(["1.4", "1.6"]), "1.6")
-        self.assertEqual(_negotiate_protocol("1.4"), "1.4")
+        self.assertEqual(_negotiate_protocol(["1.4", "1.7"]), "1.7")
+        with self.assertRaises(ElectrumServerError):
+            _negotiate_protocol(["1.4", "1.6"])
+        with self.assertRaises(ElectrumServerError):
+            _negotiate_protocol("1.4")
 
     def test_server_version(self):
-        resp = self._dispatch("server.version", ["Electrum/4.0", "1.4"])
+        resp = self._dispatch("server.version", ["Electrum/4.0", "1.7"])
         self.assertIn("result", resp)
         self.assertIsInstance(resp["result"], list)
-        self.assertEqual(len(resp["result"]), 2)
+        self.assertEqual(resp["result"][1], "1.7")
+
+    def test_server_version_legacy_client_rejected(self):
+        resp = self._dispatch("server.version", ["Electrum/4.8", ["1.4", "1.6"]])
+        self.assertIn("error", resp)
 
     def test_server_peers_subscribe(self):
         resp = self._dispatch("server.peers.subscribe")
@@ -116,9 +103,10 @@ class TestGetBalance(unittest.TestCase):
 
     def setUp(self):
         self.server = _make_server()
-        with patch("eps.server.address_to_scripthash", return_value="testhash"), \
-             patch("eps.addresses.ScriptWatcher.register_address"):
-            self.server.register_address("bc1qtest")
+        self.spk = "0014" + "11" * 20
+        self.server._script_watcher.ensure_watched = MagicMock()
+        self.server._script_watcher.address_for_spk = MagicMock(
+            return_value="bc1qtest")
 
     def test_balance_sums_utxos(self):
         self.server.rpc.listunspent.side_effect = [
@@ -128,20 +116,12 @@ class TestGetBalance(unittest.TestCase):
             [{"amount": 0.01}],
         ]
         resp = self.server._dispatch(
-            {"id": 1, "method": "blockchain.scripthash.get_balance",
-             "params": ["testhash"]},
+            {"id": 1, "method": "blockchain.scriptpubkey.get_balance",
+             "params": [self.spk]},
             "peer"
         )
         self.assertEqual(resp["result"]["confirmed"], 75_000_000)
         self.assertEqual(resp["result"]["unconfirmed"], 1_000_000)
-
-    def test_balance_unknown_scripthash(self):
-        resp = self.server._dispatch(
-            {"id": 1, "method": "blockchain.scripthash.get_balance",
-             "params": ["unknown"]},
-            "peer"
-        )
-        self.assertEqual(resp["result"], {"confirmed": 0, "unconfirmed": 0})
 
 
 class TestGetMerkle(unittest.TestCase):
@@ -271,32 +251,10 @@ class TestBlockHeaders(unittest.TestCase):
         self.assertEqual(len(result["headers"]), 3)
         self.assertEqual(len(result["headers"][0]), 160)
 
-    def test_block_headers_14_format(self):
-        state = ClientState()
-        state.protocol_version = "1.4"
-        t = threading.current_thread()
-        self.server._clients[t] = (MagicMock(), state)
-        self.server.rpc.getblockcount.return_value = 100
-        self.server.rpc.getblockhash.return_value = "blockhash"
-        self.server.rpc.getblock.return_value = "bb" * 100
-        try:
-            resp = self.server._dispatch(
-                {"id": 1, "method": "blockchain.block.headers", "params": [0, 2]},
-                "peer",
-            )
-        finally:
-            self.server._clients.pop(t, None)
-        result = resp["result"]
-        self.assertIn("hex", result)
-        self.assertNotIn("headers", result)
-        self.assertEqual(result["count"], 2)
-        self.assertEqual(result["max"], 2016)
-
-
 class TestPushScriptNotifications(unittest.TestCase):
-    """Notification identifiers per finalized protocol 1.7:
-    scripthash subs are keyed by scripthash; scriptpubkey subs are keyed by
-    scripthash(spk) — Electrum's interface converts spk -> sh for matching."""
+    """Notification identifiers per finalized protocol 1.7: scriptpubkey
+    subs are keyed by scripthash(spk) — Electrum's interface converts
+    spk -> sh for matching."""
 
     def setUp(self):
         self.server = _make_server()
@@ -325,20 +283,6 @@ class TestPushScriptNotifications(unittest.TestCase):
         from eps.addresses import scriptpubkey_to_scripthash
         self.assertEqual(msgs[0]["params"][0], scriptpubkey_to_scripthash(spk))
         self.assertNotEqual(msgs[0]["params"][0], spk)
-
-    def test_scripthash_notification_uses_scripthash_identifier(self):
-        sh = "ab" * 32
-        conn = MagicMock()
-        state = ClientState()
-        state.scripthash_subs.add(sh)
-        self.server._clients["c1"] = (conn, state)
-
-        self.server._push_script_notifications()
-
-        msgs = self._sent(conn)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0]["method"], "blockchain.scripthash.subscribe")
-        self.assertEqual(msgs[0]["params"][0], sh)
 
     def test_unchanged_status_not_repushed(self):
         spk = "76a914" + "22" * 20 + "88ac"

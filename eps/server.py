@@ -25,7 +25,10 @@ from .addresses import address_to_scripthash, scriptpubkey_to_scripthash, Script
 
 logger = logging.getLogger("eps.server")
 
-PROTOCOL_VERSION_MIN = "1.4"
+# Protocol 1.7 only: clients send scriptPubKeys directly, so the server
+# needs no wallet knowledge. Older protocols query by scripthash (a one-way
+# hash), which would require pre-registering wallet addresses.
+PROTOCOL_VERSION_MIN = "1.7"
 PROTOCOL_VERSION_MAX = "1.7"
 PROTOCOL_VERSION = PROTOCOL_VERSION_MIN  # default for legacy callers
 SERVER_VERSION = "EPS-plugin/0.1.0"
@@ -100,7 +103,6 @@ def _merkle_branch(txids: List[str], pos: int) -> List[str]:
 class ClientState:
     def __init__(self):
         self.protocol_version: str = PROTOCOL_VERSION_MIN
-        self.scripthash_subs: set = set()
         self.scriptpubkey_subs: set = set()   # spk hex strings
         self.outpoint_subs: set = set()       # (txid, vout) tuples
         self.headers_sub: bool = False
@@ -143,11 +145,9 @@ class ElectrumServer:
         self._clients: Dict[threading.Thread, tuple] = {}
         self._clients_lock = threading.Lock()
 
-        # Per-instance scripthash → address cache (populated by register_address)
-        self._scripthash_cache: Dict[str, str] = {}
         self._script_watcher = ScriptWatcher(rpc)
 
-        # Last pushed subscription status (scripthash hex -> status or None)
+        # Last pushed subscription status (spk hex -> status or None)
         self._status_cache: Dict[str, Optional[str]] = {}
 
         # Notification callbacks set by qt.py (so the GUI can update status)
@@ -366,11 +366,8 @@ class ElectrumServer:
         }
 
     def _method_server_ping(self, params, peer):
-        state = self._client_state()
-        if state and _protocol_tuple(state.protocol_version) >= (1, 7):
-            pong_len = int(params[0]) if params else 0
-            return {"data": "0" * pong_len}
-        return None
+        pong_len = int(params[0]) if params else 0
+        return {"data": "0" * pong_len}
 
     def _method_server_peers_subscribe(self, params, peer):
         return []   # we are a single-server setup; no peers
@@ -385,26 +382,6 @@ class ElectrumServer:
             if entry:
                 entry[1].headers_sub = True
         return self._current_header()
-
-    def _method_blockchain_scripthash_subscribe(self, params, peer):
-        if not params:
-            raise ElectrumServerError("scripthash required")
-        scripthash = params[0]
-        t = threading.current_thread()
-        with self._clients_lock:
-            entry = self._clients.get(t)
-            if entry:
-                entry[1].scripthash_subs.add(scripthash)
-        return self._scripthash_status(scripthash)
-
-    def _method_blockchain_scripthash_get_history(self, params, peer):
-        return self._get_history(scripthash=params[0])
-
-    def _method_blockchain_scripthash_get_balance(self, params, peer):
-        return self._get_balance(scripthash=params[0])
-
-    def _method_blockchain_scripthash_listunspent(self, params, peer):
-        return self._listunspent(scripthash=params[0])
 
     def _method_blockchain_scriptpubkey_subscribe(self, params, peer):
         if not params:
@@ -489,10 +466,6 @@ class ElectrumServer:
     def _method_blockchain_block_headers(self, params, peer):
         start = int(params[0])
         count = int(params[1])
-        state = self._client_state()
-        proto = _protocol_tuple(
-            state.protocol_version if state else PROTOCOL_VERSION_MIN)
-
         try:
             tip = self.rpc.getblockcount()
         except RPCError:
@@ -509,13 +482,7 @@ class ElectrumServer:
                 break
 
         n = len(headers_list)
-        if proto >= (1, 6):
-            return {"headers": headers_list, "count": n, "max": BLOCK_HEADERS_MAX}
-        return {
-            "hex": "".join(headers_list),
-            "count": n,
-            "max": BLOCK_HEADERS_MAX,
-        }
+        return {"headers": headers_list, "count": n, "max": BLOCK_HEADERS_MAX}
 
     def _method_blockchain_estimatefee(self, params, peer):
         blocks = int(params[0]) if params else 6
@@ -526,20 +493,8 @@ class ElectrumServer:
         # Electrum wants BTC/kB
         return feerate
 
-    def _method_blockchain_relayfee(self, params, peer):
-        # Electrum protocol <= 1.5 polls this at startup. If we don't
-        # implement it, the server returns METHOD_NOT_FOUND (-32601) which
-        # Electrum's interface treats as GracefulDisconnect — causing the
-        # status to oscillate between "connecting" and "not connected".
-        try:
-            info = self.rpc.call("getmempoolinfo")
-            # Core returns BTC/kvB; the Electrum protocol expects BTC/kB too.
-            return info.get("mempoolminfee", 0.00001)
-        except Exception:
-            return 0.00001  # 1000 sat/kB fallback
-
     def _method_mempool_get_info(self, params, peer):
-        # Protocol >= 1.6 uses this instead of blockchain.relayfee.
+        # Protocol >= 1.6 replacement for the old blockchain.relayfee.
         try:
             info = self.rpc.call("getmempoolinfo")
             return {
@@ -580,10 +535,6 @@ class ElectrumServer:
         "server.peers.subscribe":               _method_server_peers_subscribe,
         "server.donation_address":              _method_server_donation_address,
         "blockchain.headers.subscribe":         _method_blockchain_headers_subscribe,
-        "blockchain.scripthash.subscribe":      _method_blockchain_scripthash_subscribe,
-        "blockchain.scripthash.get_history":    _method_blockchain_scripthash_get_history,
-        "blockchain.scripthash.get_balance":    _method_blockchain_scripthash_get_balance,
-        "blockchain.scripthash.listunspent":    _method_blockchain_scripthash_listunspent,
         "blockchain.scriptpubkey.subscribe":    _method_blockchain_scriptpubkey_subscribe,
         "blockchain.scriptpubkey.get_history":  _method_blockchain_scriptpubkey_get_history,
         "blockchain.scriptpubkey.get_balance":  _method_blockchain_scriptpubkey_get_balance,
@@ -596,7 +547,6 @@ class ElectrumServer:
         "blockchain.block.header":              _method_blockchain_block_header,
         "blockchain.block.headers":             _method_blockchain_block_headers,
         "blockchain.estimatefee":               _method_blockchain_estimatefee,
-        "blockchain.relayfee":                  _method_blockchain_relayfee,
         "mempool.get_info":                     _method_mempool_get_info,
         "mempool.get_fee_histogram":            _method_mempool_get_fee_histogram,
     }
@@ -610,18 +560,11 @@ class ElectrumServer:
             entry = self._clients.get(threading.current_thread())
         return entry[1] if entry else None
 
-    def _resolve_query(self, *, scripthash: str = None, spk_hex: str = None):
+    def _resolve_query(self, *, spk_hex: str = None):
         """Return (address, spk_hex) for balance/history queries."""
         if spk_hex:
             spk_hex = spk_hex.lower().strip()
             address = self._script_watcher.address_for_spk(spk_hex)
-            return address, spk_hex
-        if scripthash:
-            address = self._scripthash_to_address(scripthash)
-            if address is None:
-                address = self._script_watcher.address_for_scripthash(scripthash)
-            spk = self._script_watcher.script_for_scripthash(scripthash)
-            spk_hex = spk.hex() if spk else None
             return address, spk_hex
         return None, None
 
@@ -641,16 +584,16 @@ class ElectrumServer:
             logger.warning(f"_current_header failed: {e}")
             return {"height": 0, "hex": ""}
 
-    def _get_history(self, *, scripthash: str = None, spk_hex: str = None) -> List[dict]:
-        address, spk_hex = self._resolve_query(scripthash=scripthash, spk_hex=spk_hex)
+    def _get_history(self, *, spk_hex: str = None) -> List[dict]:
+        address, spk_hex = self._resolve_query(spk_hex=spk_hex)
         if address is None and spk_hex is None:
-            logger.debug(f"No script known for query scripthash={scripthash} spk={spk_hex}")
+            logger.debug(f"No script known for query spk={spk_hex}")
             return []
         return self._get_history_for_script(address, spk_hex)
 
     def _get_history_for_script(self, address: Optional[str], spk_hex: Optional[str]) -> List[dict]:
         """
-        Return tx history for a `scripthash`, combining several Bitcoin Core
+        Return tx history for a script, combining several Bitcoin Core
         RPCs because no single one is sufficient for a watch-only descriptor
         wallet:
 
@@ -757,8 +700,8 @@ class ElectrumServer:
                 return 0
         return tip - confs + 1
 
-    def _get_balance(self, *, scripthash: str = None, spk_hex: str = None) -> dict:
-        address, spk_hex = self._resolve_query(scripthash=scripthash, spk_hex=spk_hex)
+    def _get_balance(self, *, spk_hex: str = None) -> dict:
+        address, spk_hex = self._resolve_query(spk_hex=spk_hex)
         if address is None and spk_hex is None:
             return {"confirmed": 0, "unconfirmed": 0}
 
@@ -770,8 +713,8 @@ class ElectrumServer:
 
         return {"confirmed": confirmed, "unconfirmed": unconfirmed}
 
-    def _listunspent(self, *, scripthash: str = None, spk_hex: str = None) -> List[dict]:
-        address, spk_hex = self._resolve_query(scripthash=scripthash, spk_hex=spk_hex)
+    def _listunspent(self, *, spk_hex: str = None) -> List[dict]:
+        address, spk_hex = self._resolve_query(spk_hex=spk_hex)
         if address is None and spk_hex is None:
             return []
         result = []
@@ -878,9 +821,6 @@ class ElectrumServer:
         )
         return hashlib.sha256(history_str.encode()).hexdigest()
 
-    def _scripthash_status(self, scripthash: str) -> Optional[str]:
-        return self._history_status(self._get_history(scripthash=scripthash))
-
     def _spk_status(self, spk_hex: str) -> Optional[str]:
         return self._history_status(self._get_history(spk_hex=spk_hex))
 
@@ -911,19 +851,6 @@ class ElectrumServer:
                     spender_height = 0
                 return {"spender_txhash": spender, "spender_height": spender_height}
         return {}
-
-    def _scripthash_to_address(self, scripthash: str) -> Optional[str]:
-        """
-        Reverse-lookup: find a Bitcoin address that hashes to this scripthash.
-        Cache is populated via register_address() after wallet import.
-        """
-        return self._scripthash_cache.get(scripthash)
-
-    def register_address(self, address: str):
-        """Register an address so we can look it up by scripthash."""
-        sh = address_to_scripthash(address)
-        self._scripthash_cache[sh] = address
-        self._script_watcher.register_address(address)
 
     # ------------------------------------------------------------------
     # Notification loop — polls for new blocks and pushes to subscribers
@@ -975,34 +902,6 @@ class ElectrumServer:
         with self._clients_lock:
             clients = list(self._clients.values())
 
-        # --- scripthash subscriptions (protocol <= 1.6) ---
-        # Notification identifier is the scripthash the client subscribed with.
-        watched_sh: set = set()
-        for _conn, state in clients:
-            watched_sh.update(state.scripthash_subs)
-
-        for sh in watched_sh:
-            status = self._history_status(self._get_history(scripthash=sh))
-            cache_key = ("sh", sh)
-            if self._status_cache.get(cache_key) == status:
-                continue
-            self._status_cache[cache_key] = status
-
-            notif = json.dumps({
-                "jsonrpc": "2.0",
-                "method": "blockchain.scripthash.subscribe",
-                "params": [sh, status],
-            }).encode() + b"\n"
-
-            for conn, state in clients:
-                if sh in state.scripthash_subs:
-                    try:
-                        with state.write_lock:
-                            conn.sendall(notif)
-                    except OSError:
-                        pass
-
-        # --- scriptpubkey subscriptions (protocol >= 1.7) ---
         # Finalized 1.7: the client matches notifications by the *scripthash*
         # of the scriptPubKey it subscribed with (interface.py converts
         # spk -> sh for the notification key), so the identifier here MUST be
