@@ -558,7 +558,8 @@ class Plugin(BasePlugin):
         auth_e.setPlaceholderText('<username>:<password>')
         auth_e.setEchoMode(_ECHO_PASSWORD)
         form.addRow(_('RPC Auth:'), auth_e)
-        form.addRow('', helptext(_('Required. Bitcoin Core rpcuser/rpcpassword.'), False))
+        form.addRow('', helptext(_('Bitcoin Core rpcuser/rpcpassword. Leave blank '
+                                   'when using cookie auth (Directory below).'), False))
 
         dir_e = input_field(self.config.get("eps_rpc_datadir", ""))
         form.addRow(_('Directory:'), dir_e)
