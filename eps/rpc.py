@@ -74,10 +74,15 @@ class BitcoinRPC:
         """
         Make a single RPC call and return the 'result' field.
         Raises RPCError on a JSON-RPC error, or urllib.error.URLError
-        on a network / auth failure.
+        on a network failure.
 
         `timeout=None` blocks until Core answers (needed for long-running
         calls such as rescanblockchain).
+
+        Thread-safety note: concurrent calls are safe (each is an independent
+        HTTP request), but the incrementing request id is not synchronized —
+        harmless, since Core does not require unique ids and we never read
+        the response id.
         """
         self._id += 1
         payload = json.dumps({
@@ -93,8 +98,28 @@ class BitcoinRPC:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            # Bitcoin Core returns HTTP 500 with a JSON body on RPC errors.
-            body = json.loads(e.read())
+            # Core answers some failures without a JSON-RPC body:
+            #   401/403 auth failures  — empty body
+            #   503 work queue full    — plain text
+            #   404 unknown wallet     — plain text
+            # Report those clearly instead of surfacing a JSONDecodeError.
+            raw = e.read()
+            ctype = (e.headers.get("Content-Type") or "").lower()
+            if "json" not in ctype:
+                detail = raw.decode(errors="replace").strip()[:200]
+                if e.code in (401, 403):
+                    raise RPCError(e.code, "RPC authentication failed "
+                                           "(check rpcuser/rpcpassword or cookie)")
+                if e.code == 404:
+                    raise RPCError(e.code, f"wallet endpoint not found "
+                                           f"(is the wallet loaded?){': ' + detail if detail else ''}")
+                raise RPCError(e.code, f"HTTP {e.code} from Bitcoin Core"
+                                       f"{': ' + detail if detail else ''}")
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                raise RPCError(e.code, f"HTTP {e.code} from Bitcoin Core "
+                                       f"(unparseable response)")
 
         if body.get("error"):
             err = body["error"]

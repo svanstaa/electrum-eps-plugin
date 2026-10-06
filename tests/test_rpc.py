@@ -58,6 +58,40 @@ class TestBitcoinRPC(unittest.TestCase):
         req = call_args[0][0]
         self.assertIn("/wallet/eps", req.full_url)
 
+    @staticmethod
+    def _http_error(code, body=b"", content_type="text/plain"):
+        import urllib.error
+        e = urllib.error.HTTPError("http://x", code, "err", {}, None)
+        e.read = lambda: body
+        e.headers = {"Content-Type": content_type}
+        return e
+
+    @patch("urllib.request.urlopen")
+    def test_401_reports_auth_failure(self, mock_urlopen):
+        # Core answers bad credentials with 401 and an empty body.
+        mock_urlopen.side_effect = self._http_error(401)
+        with self.assertRaises(RPCError) as ctx:
+            self.rpc.getblockchaininfo()
+        self.assertEqual(ctx.exception.code, 401)
+        self.assertIn("authentication failed", ctx.exception.message)
+
+    @patch("urllib.request.urlopen")
+    def test_503_reports_http_error_not_jsondecode(self, mock_urlopen):
+        mock_urlopen.side_effect = self._http_error(503, b"Work queue depth exceeded")
+        with self.assertRaises(RPCError) as ctx:
+            self.rpc.getblockchaininfo()
+        self.assertEqual(ctx.exception.code, 503)
+        self.assertIn("Work queue depth exceeded", ctx.exception.message)
+
+    @patch("urllib.request.urlopen")
+    def test_500_with_json_body_still_parses_rpc_error(self, mock_urlopen):
+        mock_urlopen.side_effect = self._http_error(
+            500, b'{"result":null,"error":{"code":-5,"message":"No such tx"},"id":1}',
+            "application/json")
+        with self.assertRaises(RPCError) as ctx:
+            self.rpc.getrawtransaction("deadbeef")
+        self.assertEqual(ctx.exception.code, -5)
+
     @patch("urllib.request.urlopen")
     def test_listunspent_no_address_filter(self, mock_urlopen):
         mock_urlopen.return_value = _mock_response(result=[])
