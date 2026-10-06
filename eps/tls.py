@@ -40,6 +40,14 @@ def generate_self_signed_cert(cert_path: str, key_path: str,
     return False
 
 
+def _write_private_key(key_path: str, pem: bytes) -> None:
+    """Write the private key with 0600 from the start — creating with the
+    default umask and chmodding afterwards leaves a world-readable window."""
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(pem)
+
+
 def _try_cryptography(cert_path: str, key_path: str, hostname: str) -> bool:
     try:
         from cryptography import x509
@@ -58,16 +66,15 @@ def _try_cryptography(cert_path: str, key_path: str, hostname: str) -> bool:
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Electrum Personal Server"),
         ])
 
+        now = datetime.datetime.now(datetime.timezone.utc)
         cert = (
             x509.CertificateBuilder()
             .subject_name(subject)
             .issuer_name(issuer)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(
-                datetime.datetime.utcnow() + datetime.timedelta(days=3650)
-            )
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=3650))
             .add_extension(
                 x509.SubjectAlternativeName([x509.DNSName(hostname)]),
                 critical=False,
@@ -75,18 +82,15 @@ def _try_cryptography(cert_path: str, key_path: str, hostname: str) -> bool:
             .sign(key, hashes.SHA256())
         )
 
-        with open(key_path, "wb") as f:
-            f.write(key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.TraditionalOpenSSL,
-                serialization.NoEncryption(),
-            ))
+        _write_private_key(key_path, key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
 
         with open(cert_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
 
-        # Restrict key file permissions
-        os.chmod(key_path, 0o600)
         return True
 
     except Exception as e:
@@ -105,7 +109,13 @@ def _try_openssl_cli(cert_path: str, key_path: str, hostname: str) -> bool:
             "-keyout", key_path,
             "-out", cert_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        # Restrictive umask so openssl creates the key unreadable by others
+        # (its own 0600 handling happens after the file exists).
+        old_umask = os.umask(0o077)
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+        finally:
+            os.umask(old_umask)
         if result.returncode != 0:
             logger.debug(f"openssl failed: {result.stderr.decode()}")
             return False
