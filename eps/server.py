@@ -448,21 +448,13 @@ class ElectrumServer:
             except OSError:
                 break
 
-            if ctx:
-                try:
-                    conn = ctx.wrap_socket(conn, server_side=True)
-                except ssl.SSLError as e:
-                    logger.warning(f"TLS handshake failed from {addr}: {e}")
-                    conn.close()
-                    continue
-
             peer = f"{addr[0]}:{addr[1]}"
             logger.info(f"Client connected: {peer}")
             if self.on_client_connected:
                 self.on_client_connected(peer)
 
             t = threading.Thread(target=self._handle_client,
-                                 args=(conn, peer),
+                                 args=(conn, peer, ctx),
                                  daemon=True, name=f"eps-client-{peer}")
             with self._clients_lock:
                 self._clients[t] = (conn, ClientState())
@@ -475,7 +467,21 @@ class ElectrumServer:
     # Per-client handler
     # ------------------------------------------------------------------
 
-    def _handle_client(self, conn: socket.socket, peer: str):
+    def _handle_client(self, conn: socket.socket, peer: str,
+                       tls_ctx: Optional[ssl.SSLContext] = None):
+        # TLS handshake happens here, in the per-client thread, so a client
+        # that connects and then goes silent cannot stall the accept loop
+        # (and with it every other client's handshake).
+        if tls_ctx is not None:
+            try:
+                conn.settimeout(10.0)
+                conn = tls_ctx.wrap_socket(conn, server_side=True)
+            except (ssl.SSLError, OSError) as e:
+                logger.warning(f"TLS handshake failed from {peer}: {e}")
+                conn.close()
+                self._remove_client(peer)
+                return
+
         buf = b""
         # Find this connection's write lock (set up in _run before launching us).
         with self._clients_lock:
@@ -516,9 +522,13 @@ class ElectrumServer:
             logger.exception(f"{peer}: unhandled error: {e}")
         finally:
             conn.close()
-            t = threading.current_thread()
-            with self._clients_lock:
-                self._clients.pop(t, None)
+            self._remove_client(peer)
+
+    def _remove_client(self, peer: str):
+        t = threading.current_thread()
+        with self._clients_lock:
+            removed = self._clients.pop(t, None)
+        if removed is not None:
             logger.info(f"Client disconnected: {peer}")
             if self.on_client_disconnected:
                 self.on_client_disconnected(peer)

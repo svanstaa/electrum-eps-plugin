@@ -588,6 +588,17 @@ class TestWalletTxIndex(unittest.TestCase):
 
 
 class TestServerLifecycle(unittest.TestCase):
+    """R1/R4: bind failures must surface from start(), and an idle client
+    must not stall the TLS handshake of other clients."""
+
+    def _tls_material(self, d):
+        import subprocess
+        cert, key = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+        subprocess.run(["openssl", "req", "-new", "-x509", "-days", "1",
+                        "-nodes", "-subj", "/CN=localhost",
+                        "-keyout", key, "-out", cert],
+                       check=True, capture_output=True)
+        return cert, key
 
     def test_bind_failure_raises_from_start(self):
         import socket as _socket
@@ -622,6 +633,37 @@ class TestServerLifecycle(unittest.TestCase):
         # The server-side socket is closed on stop; the client sees EOF.
         self.assertEqual(client.recv(16), b"")
         client.close()
+
+    def test_idle_client_does_not_block_tls_handshakes(self):
+        import socket as _socket
+        import ssl as _ssl
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as d:
+            cert, key = self._tls_material(d)
+            sock = _socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            server = ElectrumServer(MagicMock(spec=BitcoinRPC),
+                                    "127.0.0.1", port, cert, key)
+            server.start()
+            try:
+                idle = _socket.create_connection(("127.0.0.1", port))
+                time.sleep(0.2)   # let the server accept it and stall in handshake
+                ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                good = ctx.wrap_socket(
+                    _socket.create_connection(("127.0.0.1", port)))
+                good.settimeout(3)
+                good.sendall(b'{"id":1,"method":"server.ping","params":[]}\n')
+                self.assertIn(b'"result"', good.recv(4096))
+                good.close()
+                idle.close()
+            finally:
+                server.stop()
 
 
 class TestPushScriptNotifications(unittest.TestCase):
