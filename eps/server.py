@@ -406,6 +406,21 @@ class ElectrumServer:
                 self._server_sock.close()
             except Exception:
                 pass
+        # Close live client connections so their threads exit promptly
+        # instead of lingering until the recv timeout. shutdown() first:
+        # a bare close() only drops the fd while a client thread may still
+        # be blocked in recv() on the duplicated descriptor.
+        with self._clients_lock:
+            conns = [conn for conn, _state in self._clients.values()]
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
         if self._thread:
             self._thread.join(timeout=5)
 

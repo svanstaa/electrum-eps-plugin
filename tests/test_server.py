@@ -603,6 +603,26 @@ class TestServerLifecycle(unittest.TestCase):
         finally:
             blocker.close()
 
+    def test_stop_closes_client_connections(self):
+        import socket as _socket
+        import time
+
+        sock = _socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        server = ElectrumServer(MagicMock(spec=BitcoinRPC),
+                                "127.0.0.1", port)   # plaintext
+        server.start()
+        time.sleep(0.1)
+        client = _socket.create_connection(("127.0.0.1", port))
+        client.settimeout(3)
+        time.sleep(0.2)
+        server.stop()
+        # The server-side socket is closed on stop; the client sees EOF.
+        self.assertEqual(client.recv(16), b"")
+        client.close()
+
 
 class TestPushScriptNotifications(unittest.TestCase):
     """Notification identifiers per finalized protocol 1.7: scriptpubkey
