@@ -67,7 +67,10 @@ background threads to the GUI are marshalled through a Qt signal
 ## Bitcoin Core setup
 
 The plugin needs RPC access to a Bitcoin Core node and a dedicated
-watch-only descriptor wallet to import addresses into.
+watch-only descriptor wallet to import addresses into. `txindex` is
+**not** required: transactions and history are served from the
+watch-only wallet, and block headers via `getblockheader`, so default
+and pruned nodes both work.
 
 ### Authentication
 

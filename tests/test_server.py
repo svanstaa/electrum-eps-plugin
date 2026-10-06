@@ -226,30 +226,42 @@ class TestScriptPubKey(unittest.TestCase):
 
 
 class TestBlockHeaders(unittest.TestCase):
+    """Header endpoints must use getblockheader(verbose=False): it returns
+    exactly the 80-byte header and works on pruned nodes, unlike fetching
+    the whole raw block and slicing it."""
+
+    HEADER = "aa" * 80
 
     def setUp(self):
         self.server = _make_server()
+        self.server.rpc.getblockcount.return_value = 100
+        self.server.rpc.getblockhash.side_effect = lambda h: f"hash{h}"
+        self.server.rpc.getblockheader.return_value = self.HEADER
+
+    def _dispatch(self, method, params):
+        return self.server._dispatch(
+            {"id": 1, "method": method, "params": params}, "peer")
 
     def test_block_headers_17_format(self):
-        state = ClientState()
-        state.protocol_version = "1.7"
-        t = threading.current_thread()
-        self.server._clients[t] = (MagicMock(), state)
-        self.server.rpc.getblockcount.return_value = 100
-        self.server.rpc.getblockhash.return_value = "blockhash"
-        self.server.rpc.getblock.return_value = "aa" * 100
-        try:
-            resp = self.server._dispatch(
-                {"id": 1, "method": "blockchain.block.headers", "params": [90, 3]},
-                "peer",
-            )
-        finally:
-            self.server._clients.pop(t, None)
-        result = resp["result"]
+        result = self._dispatch("blockchain.block.headers", [90, 3])["result"]
         self.assertEqual(result["count"], 3)
         self.assertEqual(result["max"], 2016)
-        self.assertEqual(len(result["headers"]), 3)
+        self.assertEqual(result["headers"], [self.HEADER] * 3)
         self.assertEqual(len(result["headers"][0]), 160)
+        self.server.rpc.getblockheader.assert_any_call("hash90", False)
+        self.server.rpc.getblock.assert_not_called()
+
+    def test_block_header_single(self):
+        result = self._dispatch("blockchain.block.header", [42])["result"]
+        self.assertEqual(result, self.HEADER)
+        self.server.rpc.getblockheader.assert_called_once_with("hash42", False)
+        self.server.rpc.getblock.assert_not_called()
+
+    def test_headers_subscribe_uses_getblockheader(self):
+        result = self._dispatch("blockchain.headers.subscribe", [])["result"]
+        self.assertEqual(result, {"height": 100, "hex": self.HEADER})
+        self.server.rpc.getblockheader.assert_called_once_with("hash100", False)
+        self.server.rpc.getblock.assert_not_called()
 
 class TestTransactionGet(unittest.TestCase):
     """blockchain.transaction.get must not depend on -txindex: wallet txs are

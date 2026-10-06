@@ -706,13 +706,15 @@ class ElectrumServer:
         txid = self.rpc.sendrawtransaction(rawhex)
         return txid
 
+    def _raw_header(self, height: int) -> str:
+        """80-byte block header as hex. getblockheader(verbose=False) returns
+        exactly that and, unlike getblock, still works for heights a pruned
+        node has discarded."""
+        return self.rpc.getblockheader(self.rpc.getblockhash(height), False)
+
     def _method_blockchain_block_header(self, params, peer):
         height = int(params[0])
-        blockhash = self.rpc.getblockhash(height)
-        # Return raw hex header (80 bytes)
-        block = self.rpc.getblock(blockhash, 0)  # verbosity=0 → raw hex
-        # Raw block starts with the 80-byte header
-        return block[:160]  # first 80 bytes = 160 hex chars
+        return self._raw_header(height)
 
     def _method_blockchain_block_headers(self, params, peer):
         start = int(params[0])
@@ -726,9 +728,7 @@ class ElectrumServer:
         headers_list: List[str] = []
         for h in range(start, end + 1):
             try:
-                bh = self.rpc.getblockhash(h)
-                raw = self.rpc.getblock(bh, 0)
-                headers_list.append(raw[:160])
+                headers_list.append(self._raw_header(h))
             except RPCError:
                 break
 
@@ -823,13 +823,12 @@ class ElectrumServer:
         try:
             height = self.rpc.getblockcount()
             bh = self.rpc.getblockhash(height)
-            header_info = self.rpc.getblockheader(bh, True)
             with self._tip_lock:
                 self._tip_height = height
                 self._tip_hash = bh
             return {
                 "height": height,
-                "hex": self.rpc.getblock(bh, 0)[:160],
+                "hex": self.rpc.getblockheader(bh, False),
             }
         except Exception as e:
             logger.warning(f"_current_header failed: {e}")
@@ -981,9 +980,7 @@ class ElectrumServer:
 
     def _push_header_notification(self, height: int):
         try:
-            bh = self.rpc.getblockhash(height)
-            raw = self.rpc.getblock(bh, 0)
-            header_hex = raw[:160]
+            header_hex = self._raw_header(height)
             notification = json.dumps({
                 "jsonrpc": "2.0",
                 "method": "blockchain.headers.subscribe",
