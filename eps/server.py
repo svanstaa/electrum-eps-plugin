@@ -967,12 +967,16 @@ class ElectrumServer:
         address, spk_hex = self._resolve_query(spk_hex=spk_hex)
         if address is None and spk_hex is None:
             return []
+        # The protocol wants the block height (0 for unconfirmed), which
+        # listunspent does not report — take it from the wallet index.
+        heights = {txid: h for txid, h, _fee in
+                   self._wallet_index.history_for_spk(spk_hex)}
         result = []
         for utxo in self._utxos_for_script(address, spk_hex, 0, 9999999):
             result.append({
                 "tx_hash": utxo["txid"],
                 "tx_pos": utxo["vout"],
-                "height": utxo.get("confirmations", 0),
+                "height": max(0, heights.get(utxo["txid"], 0)),
                 "value": int(round(utxo["amount"] * 1e8)),
             })
         return result

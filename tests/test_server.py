@@ -368,6 +368,42 @@ class TestUtxoMatchesSpk(unittest.TestCase):
         self.assertFalse(ElectrumServer._utxo_matches_spk({}, spk))
 
 
+class TestListUnspent(unittest.TestCase):
+    """M2: the protocol's `height` field is the block height (0 for
+    unconfirmed), not listunspent's confirmation count."""
+
+    SPK = "0014" + "ab" * 20
+
+    def test_heights_come_from_wallet_index(self):
+        server = _make_server()
+        server._script_watcher.address_for_spk = MagicMock(return_value=None)
+        server._utxos_for_script = MagicMock(return_value=[
+            {"txid": "aa" * 32, "vout": 0, "amount": 0.5, "confirmations": 51},
+            {"txid": "bb" * 32, "vout": 1, "amount": 0.25, "confirmations": 0},
+        ])
+        server._wallet_index.history_for_spk = MagicMock(return_value=[
+            ("aa" * 32, 950, None),
+            ("bb" * 32, -1, 500),   # unconfirmed parent chain -> clamped to 0
+        ])
+        result = server._listunspent(spk_hex=self.SPK)
+        self.assertEqual(result, [
+            {"tx_hash": "aa" * 32, "tx_pos": 0, "height": 950,
+             "value": 50_000_000},
+            {"tx_hash": "bb" * 32, "tx_pos": 1, "height": 0,
+             "value": 25_000_000},
+        ])
+
+    def test_tx_missing_from_index_defaults_to_zero(self):
+        server = _make_server()
+        server._script_watcher.address_for_spk = MagicMock(return_value=None)
+        server._utxos_for_script = MagicMock(return_value=[
+            {"txid": "cc" * 32, "vout": 0, "amount": 0.1, "confirmations": 5},
+        ])
+        server._wallet_index.history_for_spk = MagicMock(return_value=[])
+        result = server._listunspent(spk_hex=self.SPK)
+        self.assertEqual(result[0]["height"], 0)
+
+
 class _FakeCore:
     """Just enough of Core's wallet/node RPCs for WalletTxIndex.
 
