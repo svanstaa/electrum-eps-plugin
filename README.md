@@ -4,8 +4,14 @@ An Electrum plugin that reimplements [Electrum Personal Server](https://github.c
 functionality inline, letting you connect Electrum to your own Bitcoin
 Core full node without running a separate process.
 
-Tested against Electrum's `1.7` protocol branch (PyQt6) and Bitcoin
-Core 30 on testnet4.
+Tested against Electrum's [`protocol_1.7`](https://github.com/spesmilo/electrum/tree/protocol_1.7)
+branch (PyQt6) and Bitcoin Core 30 on testnet4.
+
+> **Compatibility:** the current Electrum release (4.8.2) speaks protocol
+> 1.4–1.6 and **cannot connect** to this plugin. Protocol 1.7 — where the
+> client sends scriptPubKeys instead of scripthashes — exists only on
+> Electrum's `protocol_1.7` branch; use a build of that branch until a
+> release ships 1.7.
 
 ## What it does
 
@@ -113,7 +119,7 @@ history).
 
 ## Installing the plugin (end users)
 
-1. Download `eps-X.Y.Z.zip` from the [GitHub releases](#) page.
+1. Download `eps-X.Y.Z.zip` from the [GitHub releases](https://github.com/svanstaa/electrum-eps-plugin/releases) page.
 2. In Electrum: **Tools → Plugins → Add** → select the zip.
 3. Authorize with your Electrum plugin password (set on first use).
 4. Restart Electrum; **EPS Settings** now appears in the **Wallet** menu.
