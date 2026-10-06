@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from eps.rpc import BitcoinRPC, RPCError
 from eps.server import (
-    ElectrumServer, ClientState, MempoolIndex, _merkle_branch,
+    ElectrumServer, ClientState, WalletTxIndex, _merkle_branch,
     _negotiate_protocol, PROTOCOL_VERSION_MIN, PROTOCOL_VERSION_MAX,
 )
 
@@ -251,107 +251,282 @@ class TestBlockHeaders(unittest.TestCase):
         self.assertEqual(len(result["headers"]), 3)
         self.assertEqual(len(result["headers"][0]), 160)
 
-class TestMempoolIndex(unittest.TestCase):
-    """The index tracks unconfirmed *wallet* txs keyed by every scriptPubKey
-    they touch, so history queries no longer walk the whole mempool."""
+class TestUtxoMatchesSpk(unittest.TestCase):
 
-    SPK_OUT = "0014" + "aa" * 20
-    SPK_PREV = "0014" + "bb" * 20
-    TXID = "11" * 32
-    PREV_TXID = "22" * 32
+    def test_matches_on_listunspent_scriptpubkey_field_without_rpc(self):
+        spk = "0014" + "ab" * 20
+        self.assertTrue(ElectrumServer._utxo_matches_spk(
+            {"scriptPubKey": spk.upper(), "txid": "x", "vout": 0}, spk))
+        self.assertFalse(ElectrumServer._utxo_matches_spk(
+            {"scriptPubKey": "0014" + "cd" * 20}, spk))
+        self.assertFalse(ElectrumServer._utxo_matches_spk({}, spk))
 
-    def _make_index(self, unconfirmed_txids, gettxout=None):
-        rpc = MagicMock(spec=BitcoinRPC)
 
-        def _call(method, *params):
-            if method == "listsinceblock":
-                return {"transactions": [
-                    {"txid": txid, "confirmations": 0}
-                    for txid in unconfirmed_txids]}
-            if method == "gettxout":
-                return gettxout
-            raise AssertionError(f"unexpected RPC {method}")
+class _FakeCore:
+    """Just enough of Core's wallet/node RPCs for WalletTxIndex.
 
-        rpc.call.side_effect = _call
-        rpc.getrawtransaction.return_value = {
-            "vout": [{"scriptPubKey": {"hex": self.SPK_OUT}}],
-            "vin": [{"txid": self.PREV_TXID, "vout": 0}],
+    wallet_txs: txid -> {"confirmations", "blockheight"?, "decoded", "from_me"?}
+    mempool:    txid -> getmempoolentry result
+    utxos:      (txid, n) -> scriptPubKey hex    (gettxout, unspent only)
+    raw:        txid -> decoded tx                (getrawtransaction)
+    """
+
+    def __init__(self):
+        self.wallet_txs = {}
+        self.mempool = {}
+        self.utxos = {}
+        self.raw = {}
+        self.removed = []
+        self.lastblock = "tip0"
+        self.calls = []
+        self.rpc = MagicMock(spec=BitcoinRPC)
+        self.rpc.call.side_effect = self._call
+        self.rpc.getrawtransaction.side_effect = self._getraw
+        self.rpc.getblockcount.return_value = 100
+
+    def add_tx(self, txid, *, vouts=(), vins=(), confirmations=0,
+               blockheight=None, from_me=False):
+        decoded = {
+            "txid": txid,
+            "vout": [{"n": i, "scriptPubKey": {"hex": spk}}
+                     for i, spk in enumerate(vouts)],
+            "vin": [({"coinbase": "00"} if v is None
+                     else {"txid": v[0], "vout": v[1]}) for v in vins],
         }
-        return MempoolIndex(rpc)
+        entry = {"confirmations": confirmations, "decoded": decoded,
+                 "from_me": from_me}
+        if blockheight is not None:
+            entry["blockheight"] = blockheight
+        self.wallet_txs[txid] = entry
 
-    def test_indexes_output_spk(self):
-        idx = self._make_index([self.TXID])
-        self.assertEqual(idx.txids_for_spk(self.SPK_OUT), {self.TXID})
-        self.assertEqual(idx.txids_for_spk("0014" + "cc" * 20), set())
+    def method_calls(self, method):
+        return [c for c in self.calls if c[0] == method]
 
-    def test_indexes_prevout_spk_via_gettxout(self):
-        idx = self._make_index(
-            [self.TXID],
-            gettxout={"scriptPubKey": {"hex": self.SPK_PREV}})
-        self.assertEqual(idx.txids_for_spk(self.SPK_PREV), {self.TXID})
+    def _call(self, method, *params):
+        self.calls.append((method,) + params)
+        if method == "listsinceblock":
+            txs = []
+            for txid, v in self.wallet_txs.items():
+                e = {"txid": txid, "confirmations": v["confirmations"]}
+                if "blockheight" in v:
+                    e["blockheight"] = v["blockheight"]
+                txs.append(e)
+            return {"transactions": txs, "removed": list(self.removed),
+                    "lastblock": self.lastblock}
+        if method == "gettransaction":
+            v = self.wallet_txs.get(params[0])
+            if v is None:
+                raise RPCError(-5, "Invalid or non-wallet transaction id")
+            out = {"txid": params[0], "hex": "00", "decoded": v["decoded"],
+                   "confirmations": v["confirmations"]}
+            if v["from_me"]:
+                out["fee"] = -0.00001
+            return out
+        if method == "getmempoolentry":
+            if params[0] not in self.mempool:
+                raise RPCError(-5, "Transaction not in mempool")
+            return self.mempool[params[0]]
+        if method == "gettxout":
+            spk = self.utxos.get((params[0], params[1]))
+            return {"scriptPubKey": {"hex": spk}} if spk else None
+        raise AssertionError(f"unexpected RPC {method}")
 
-    def test_prevout_fallback_to_getrawtransaction(self):
-        # gettxout returns None (unconfirmed parent); the raw parent tx is
-        # fetched instead. Parent's vout[0] carries SPK_PREV.
-        idx = self._make_index([self.TXID], gettxout=None)
+    def _getraw(self, txid, verbose=False):
+        if txid in self.raw:
+            return self.raw[txid]
+        raise RPCError(-5, "No such mempool transaction. Use -txindex ...")
 
-        def _getraw(txid, verbose):
-            if txid == self.TXID:
-                return {
-                    "vout": [{"scriptPubKey": {"hex": self.SPK_OUT}}],
-                    "vin": [{"txid": self.PREV_TXID, "vout": 0}],
-                }
-            return {"vout": [{"scriptPubKey": {"hex": self.SPK_PREV}}]}
 
-        idx.rpc.getrawtransaction.side_effect = _getraw
-        self.assertEqual(idx.txids_for_spk(self.SPK_PREV), {self.TXID})
+class TestWalletTxIndex(unittest.TestCase):
+    """The index attributes every wallet tx to the scripts it pays to *and*
+    spends from, which Core's listsinceblock cannot do (send entries carry
+    the destination address; change outputs are omitted)."""
+
+    SPK_A = "0014" + "aa" * 20
+    SPK_B = "0014" + "bb" * 20
+    SPK_X = "0014" + "ee" * 20     # external destination
+    P = "11" * 32                  # parent, pays SPK_A
+    T = "22" * 32                  # spends P:0 -> SPK_X (+ change SPK_B)
+    F = "33" * 32                  # foreign parent (not a wallet tx)
+
+    def setUp(self):
+        self.core = _FakeCore()
+        self.idx = WalletTxIndex(self.core.rpc)
+
+    def _hist(self, spk):
+        return sorted(self.idx.history_for_spk(spk))
+
+    def _force_refresh(self):
+        self.idx._last_refresh = 0.0
+
+    def test_confirmed_receive_indexed_by_output_spk(self):
+        self.core.add_tx(self.P, vouts=[self.SPK_A], vins=[(self.F, 0)],
+                         confirmations=11, blockheight=90)
+        self.assertEqual(self._hist(self.SPK_A), [(self.P, 90, None)])
+        self.assertEqual(self._hist(self.SPK_B), [])
+
+    def test_confirmed_spend_attributed_to_spent_script(self):
+        # The H1 regression: once T confirms it must still appear in SPK_A's
+        # history (it spends P:0 which paid SPK_A) and in the change script's.
+        self.core.add_tx(self.P, vouts=[self.SPK_A], vins=[(self.F, 0)],
+                         confirmations=11, blockheight=90)
+        self.core.add_tx(self.T, vouts=[self.SPK_X, self.SPK_B],
+                         vins=[(self.P, 0)], confirmations=6, blockheight=95,
+                         from_me=True)
+        self.assertEqual(self._hist(self.SPK_A),
+                         [(self.P, 90, None), (self.T, 95, None)])
+        self.assertEqual(self._hist(self.SPK_B), [(self.T, 95, None)])
+        self.assertEqual(self._hist(self.SPK_X), [(self.T, 95, None)])
+
+    def test_confirmed_receive_skips_foreign_input_lookups(self):
+        # No 'fee' in gettransaction => no input is ours; a confirmed tx must
+        # not issue per-input lookups that would only fail without txindex.
+        self.core.add_tx(self.P, vouts=[self.SPK_A],
+                         vins=[(self.F, 0), (self.F, 1)],
+                         confirmations=1, blockheight=100)
+        self._hist(self.SPK_A)
+        gettx = self.core.method_calls("gettransaction")
+        self.assertEqual([c[1] for c in gettx], [self.P])
+        self.assertEqual(self.core.method_calls("gettxout"), [])
+        self.core.rpc.getrawtransaction.assert_not_called()
+
+    def test_unconfirmed_spend_resolves_prevout_via_gettxout(self):
+        # Wallet doesn't know the parent (imported with timestamp 'now'), but
+        # while T is unconfirmed the prevout is still in the UTXO set.
+        self.core.add_tx(self.T, vouts=[self.SPK_X], vins=[(self.F, 0)],
+                         confirmations=0)
+        self.core.mempool[self.T] = {"fees": {"base": 0.00001}, "ancestorcount": 1}
+        self.core.utxos[(self.F, 0)] = self.SPK_A
+        self.assertEqual(self._hist(self.SPK_A), [(self.T, 0, 1000)])
+
+    def test_unconfirmed_spend_falls_back_to_getrawtransaction(self):
+        # Unconfirmed parent: not a wallet tx, not in the UTXO set, but in
+        # the mempool so getrawtransaction works without txindex.
+        self.core.add_tx(self.T, vouts=[self.SPK_X], vins=[(self.F, 1)],
+                         confirmations=0)
+        self.core.mempool[self.T] = {"fees": {"base": 0.00002}, "ancestorcount": 2}
+        self.core.raw[self.F] = {"vout": [
+            {"scriptPubKey": {"hex": self.SPK_B}},
+            {"scriptPubKey": {"hex": self.SPK_A}}]}
+        self.assertEqual(self._hist(self.SPK_A), [(self.T, -1, 2000)])
+        self.assertEqual(self._hist(self.SPK_B), [])   # wrong vout
 
     def test_coinbase_input_skipped(self):
-        idx = self._make_index([self.TXID])
-        idx.rpc.getrawtransaction.return_value = {
-            "vout": [{"scriptPubKey": {"hex": self.SPK_OUT}}],
-            "vin": [{"coinbase": "00"}],   # no txid/vout keys
-        }
-        self.assertEqual(idx.txids_for_spk(self.SPK_OUT), {self.TXID})
+        self.core.add_tx(self.P, vouts=[self.SPK_A], vins=[None],
+                         confirmations=0)
+        self.core.mempool[self.P] = {"fees": {"base": 0}, "ancestorcount": 1}
+        self.assertEqual(self._hist(self.SPK_A), [(self.P, 0, 0)])
 
-    def test_evicts_confirmed_tx(self):
-        idx = self._make_index([self.TXID])
-        self.assertEqual(idx.txids_for_spk(self.SPK_OUT), {self.TXID})
+    def test_unconfirmed_tx_missing_from_mempool_is_excluded(self):
+        # confirmations == 0 but not in the mempool: abandoned or replaced.
+        self.core.add_tx(self.T, vouts=[self.SPK_A], confirmations=0)
+        self.assertEqual(self._hist(self.SPK_A), [])
 
-        # Tx confirmed: listsinceblock no longer reports it unconfirmed.
-        def _call(method, *params):
-            if method == "listsinceblock":
-                return {"transactions": [
-                    {"txid": self.TXID, "confirmations": 1}]}
-            return None
-        idx.rpc.call.side_effect = _call
-        idx._last_refresh = 0.0   # force refresh past the TTL
-        self.assertEqual(idx.txids_for_spk(self.SPK_OUT), set())
+    def test_conflicted_tx_evicted(self):
+        self.core.add_tx(self.T, vouts=[self.SPK_A], confirmations=2,
+                         blockheight=99)
+        self.assertEqual(self._hist(self.SPK_A), [(self.T, 99, None)])
+        self.core.wallet_txs[self.T]["confirmations"] = -1
+        self._force_refresh()
+        self.assertEqual(self._hist(self.SPK_A), [])
+
+    def test_confirming_updates_height_without_redecoding(self):
+        self.core.add_tx(self.T, vouts=[self.SPK_A], confirmations=0)
+        self.core.mempool[self.T] = {"fees": {"base": 0.00001}, "ancestorcount": 1}
+        self.assertEqual(self._hist(self.SPK_A), [(self.T, 0, 1000)])
+
+        self.core.wallet_txs[self.T].update(confirmations=1, blockheight=100)
+        del self.core.mempool[self.T]
+        self._force_refresh()
+        self.assertEqual(self._hist(self.SPK_A), [(self.T, 100, None)])
+        self.assertEqual(len(self.core.method_calls("gettransaction")), 1)
+
+    def test_reorged_out_tx_evicted_via_removed(self):
+        self.core.add_tx(self.T, vouts=[self.SPK_A], confirmations=1,
+                         blockheight=100)
+        self._hist(self.SPK_A)
+        del self.core.wallet_txs[self.T]
+        self.core.removed = [{"txid": self.T, "confirmations": -1}]
+        self._force_refresh()
+        self.assertEqual(self._hist(self.SPK_A), [])
+
+    def test_purged_unconfirmed_tx_evicted(self):
+        self.core.add_tx(self.T, vouts=[self.SPK_A], confirmations=0)
+        self.core.mempool[self.T] = {"fees": {"base": 0.00001}, "ancestorcount": 1}
+        self._hist(self.SPK_A)
+        del self.core.wallet_txs[self.T]
+        self._force_refresh()
+        self.assertEqual(self._hist(self.SPK_A), [])
+
+    def test_incremental_cursor_advances(self):
+        self.core.add_tx(self.P, vouts=[self.SPK_A], confirmations=1,
+                         blockheight=100)
+        self._hist(self.SPK_A)
+        self.core.lastblock = "tip1"
+        self._force_refresh()
+        self._hist(self.SPK_A)
+        self._force_refresh()
+        self._hist(self.SPK_A)
+        cursors = [c[1] for c in self.core.method_calls("listsinceblock")]
+        self.assertEqual(cursors, ["", "tip0", "tip1"])
+
+    def test_decode_failure_does_not_advance_cursor(self):
+        self.core.add_tx(self.P, vouts=[self.SPK_A], confirmations=1,
+                         blockheight=100)
+        real_call = self.core._call
+        failures = {"n": 0}
+
+        def flaky(method, *params):
+            if method == "gettransaction" and failures["n"] == 0:
+                failures["n"] += 1
+                raise RPCError(-28, "Loading wallet…")
+            return real_call(method, *params)
+
+        self.core.rpc.call.side_effect = flaky
+        self.assertEqual(self._hist(self.SPK_A), [])        # failed, retried later
+        self._force_refresh()
+        self.assertEqual(self._hist(self.SPK_A), [(self.P, 100, None)])
+        cursors = [c[1] for c in self.core.method_calls("listsinceblock")]
+        self.assertEqual(cursors, ["", ""])                 # cursor held back
+
+    def test_height_from_confirmations_when_blockheight_missing(self):
+        self.core.add_tx(self.P, vouts=[self.SPK_A], confirmations=6)   # no blockheight
+        self.assertEqual(self._hist(self.SPK_A), [(self.P, 95, None)])
 
     def test_ttl_prevents_repeated_refresh(self):
-        idx = self._make_index([self.TXID])
-        idx.txids_for_spk(self.SPK_OUT)
-        idx.txids_for_spk(self.SPK_OUT)
-        calls = [c for c in idx.rpc.call.call_args_list
-                 if c[0][0] == "listsinceblock"]
-        self.assertEqual(len(calls), 1)
+        self.core.add_tx(self.P, vouts=[self.SPK_A], confirmations=1, blockheight=100)
+        self._hist(self.SPK_A)
+        self._hist(self.SPK_A)
+        self.assertEqual(len(self.core.method_calls("listsinceblock")), 1)
 
-    def test_history_includes_indexed_mempool_tx(self):
-        # Integration: _get_history picks up the indexed unconfirmed tx and
-        # decorates it with the mempool fee, per protocol requirements.
+    def test_refresh_error_resets_cursor(self):
+        self.core.add_tx(self.P, vouts=[self.SPK_A], confirmations=1, blockheight=100)
+        self._hist(self.SPK_A)
+        self.assertEqual(self.idx._last_block, "tip0")
+        real_call = self.core._call
+        self.core.rpc.call.side_effect = lambda m, *p: (
+            (_ for _ in ()).throw(RPCError(-5, "Block not found"))
+            if m == "listsinceblock" else real_call(m, *p))
+        self._force_refresh()
+        self._hist(self.SPK_A)
+        self.assertEqual(self.idx._last_block, "")
+
+    def test_server_history_format_from_index(self):
+        # _get_history orders confirmed entries by height then appends
+        # mempool entries with their fee; entries without a fee are dropped.
         server = _make_server()
-        spk = self.SPK_OUT
-        server._script_watcher.address_for_spk = MagicMock(return_value=None)
-        server.rpc.listunspent.return_value = []
-        server._mempool_index.txids_for_spk = MagicMock(
-            return_value={self.TXID})
-        server.rpc.call.side_effect = lambda method, *p: (
-            {"fees": {"base": 0.00001}, "ancestorcount": 1}
-            if method == "getmempoolentry" else None)
-
-        history = server._get_history(spk_hex=spk)
-        self.assertEqual(history, [
-            {"tx_hash": self.TXID, "height": 0, "fee": 1000}])
+        server._wallet_index.history_for_spk = MagicMock(return_value=[
+            ("c" * 64, 0, 1500),
+            ("b" * 64, 120, None),
+            ("a" * 64, 100, None),
+            ("d" * 64, -1, None),       # no fee -> skipped
+        ])
+        self.assertEqual(server._get_history(spk_hex=self.SPK_A.upper()), [
+            {"tx_hash": "a" * 64, "height": 100},
+            {"tx_hash": "b" * 64, "height": 120},
+            {"tx_hash": "c" * 64, "height": 0, "fee": 1500},
+        ])
+        server._wallet_index.history_for_spk.assert_called_once_with(self.SPK_A)
 
 
 class TestPushScriptNotifications(unittest.TestCase):

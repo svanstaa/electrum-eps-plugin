@@ -169,9 +169,10 @@ embedded server's address.
   bulk-import rescan (bounded by the wallet birth date). A debounced
   automatic rescan after on-demand imports — making the xpub bulk
   import fully optional — is planned.
-- History lookup is `O(mempool size)` per `get_history` call. Fine at
-  personal-server scale; a per-address incremental index would scale
-  better on a busy mainnet node.
+- The first history query after startup decodes every wallet transaction
+  once (`gettransaction` per tx) to build the script index; on a wallet
+  with thousands of transactions this takes a few seconds. Subsequent
+  refreshes are incremental.
 - Requires a protocol 1.7 client (Electrum's `protocol_1.7` branch, or
   any release that ships 1.7). Released Electrum ≤ 4.8 speaks 1.4–1.6
   only and cannot connect.

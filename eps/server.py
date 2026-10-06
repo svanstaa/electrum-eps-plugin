@@ -18,10 +18,10 @@ import threading
 import hashlib
 import time
 import logging
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Tuple
 
 from .rpc import BitcoinRPC, RPCError
-from .addresses import address_to_scripthash, scriptpubkey_to_scripthash, ScriptWatcher
+from .addresses import scriptpubkey_to_scripthash, ScriptWatcher
 
 logger = logging.getLogger("eps.server")
 
@@ -97,24 +97,43 @@ def _merkle_branch(txids: List[str], pos: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Mempool index
+# Wallet transaction index
 # ---------------------------------------------------------------------------
 
-class MempoolIndex:
+class _IndexedTx:
+    __slots__ = ("spks", "height", "fee_sats")
+
+    def __init__(self, spks: set):
+        self.spks = spks
+        # Block height; 0 = mempool, -1 = mempool with an unconfirmed parent.
+        self.height: int = 0
+        # Mempool txs only (the protocol requires a fee on mempool entries).
+        self.fee_sats: Optional[int] = None
+
+
+class WalletTxIndex:
     """
-    Incremental index of *unconfirmed wallet transactions*, keyed by the
-    scriptPubKeys they touch (all outputs plus all spent prevouts).
+    Incremental index of the Core wallet's transactions, keyed by every
+    scriptPubKey they touch (all outputs plus the prevouts they spend).
 
     Every script a client queries is imported into the Core wallet first
-    (ScriptWatcher.ensure_watched), so any mempool tx that can affect a
-    subscribed script is a wallet transaction and appears in listsinceblock
-    with confirmations <= 0. Indexing only those keeps each refresh
-    O(own unconfirmed txs); the previous full-mempool walk was O(mempool)
-    getrawtransaction calls *per query* — minutes per startup on mainnet.
+    (ScriptWatcher.ensure_watched), so a script's Electrum history is exactly
+    the set of wallet transactions that pay to it or spend from it. No Core
+    RPC answers that directly: listsinceblock / listtransactions report
+    'send' entries under the *destination* address and omit change outputs
+    altogether, so a spend can never be attributed to the script it spent
+    from that way. This index decodes each wallet tx once (gettransaction,
+    which works without -txindex and on pruned nodes) and does the
+    attribution itself.
 
-    Known limitation (shared with the original EPS): a tx that was already
-    in the mempool before its script was imported into the wallet is not
-    seen until it confirms.
+    Refreshes are incremental: listsinceblock(<last seen block>) returns the
+    txs confirmed since then plus everything still unconfirmed, so the
+    steady-state cost is O(unconfirmed wallet txs) per refresh regardless of
+    wallet size. The first refresh decodes the whole wallet once.
+
+    Known limitation (shared with the original EPS): a tx that was already in
+    the mempool before its script was imported into the wallet is not seen
+    until it confirms.
     """
 
     TTL = 2.0  # seconds; one refresh serves a whole burst of subscriptions
@@ -123,15 +142,23 @@ class MempoolIndex:
         self.rpc = rpc
         self._lock = threading.Lock()
         self._last_refresh = 0.0
-        self._txid_to_spks: Dict[str, set] = {}
+        self._last_block = ""   # listsinceblock cursor; "" = full scan
+        self._txs: Dict[str, _IndexedTx] = {}
         self._spk_to_txids: Dict[str, set] = {}
 
-    def txids_for_spk(self, spk_hex: str) -> set:
-        """Unconfirmed wallet txids touching `spk_hex` (refreshes if stale)."""
+    def history_for_spk(self, spk_hex: str) -> List[Tuple[str, int, Optional[int]]]:
+        """(txid, height, fee_sats) for every wallet tx touching `spk_hex`.
+
+        height > 0 is a confirmed block height; 0 / -1 is mempool, with
+        fee_sats set when Core reported one. Refreshes the index if stale.
+        """
         spk_hex = spk_hex.lower()
         with self._lock:
             self._maybe_refresh()
-            return set(self._spk_to_txids.get(spk_hex, ()))
+            return [(txid, self._txs[txid].height, self._txs[txid].fee_sats)
+                    for txid in self._spk_to_txids.get(spk_hex, ())]
+
+    # -- refresh -------------------------------------------------------
 
     def _maybe_refresh(self):
         now = time.monotonic()
@@ -139,51 +166,135 @@ class MempoolIndex:
             return
         self._last_refresh = now
         try:
-            result = self.rpc.call("listsinceblock", "", 1, True, True)
+            self._refresh()
         except RPCError as e:
-            logger.debug(f"mempool index: listsinceblock failed: {e}")
+            logger.warning(f"wallet index: refresh failed, will resync: {e}")
+            self._last_block = ""
+
+    def _refresh(self):
+        result = self.rpc.call("listsinceblock", self._last_block, 1, True, True)
+        # listsinceblock yields one entry per (tx, address, category);
+        # collapse to one per txid — the height fields are identical.
+        entries: Dict[str, dict] = {}
+        for e in result.get("transactions", []):
+            entries.setdefault(e["txid"], e)
+        if not self._last_block and len(entries) > 200:
+            logger.info(f"wallet index: indexing {len(entries)} wallet transactions…")
+
+        complete = True
+        tip: Optional[int] = None
+        for txid, e in entries.items():
+            confs = e.get("confirmations", 0)
+            if confs < 0:                       # conflicted
+                self._evict(txid)
+                continue
+            if confs == 0:
+                mem = self._mempool_info(txid)
+                if mem is None:                 # abandoned / replaced / dropped
+                    self._evict(txid)
+                    continue
+                height, fee = mem
+            else:
+                height = e.get("blockheight")
+                if height is None:              # Core < 0.20
+                    if tip is None:
+                        tip = self.rpc.getblockcount()
+                    height = tip - confs + 1
+                fee = None
+
+            tx = self._txs.get(txid)
+            if tx is None:
+                spks = self._spks_touched(txid, confirmed=confs > 0)
+                if spks is None:
+                    complete = False            # transient failure: retry next refresh
+                    continue
+                tx = self._txs[txid] = _IndexedTx(spks)
+                for spk in spks:
+                    self._spk_to_txids.setdefault(spk, set()).add(txid)
+            tx.height, tx.fee_sats = height, fee
+
+        # Txs in blocks that were reorged out and did not come back.
+        for e in result.get("removed", []):
+            if e["txid"] not in entries:
+                self._evict(e["txid"])
+        # Unconfirmed txs are reported on every call; any we knew that no
+        # longer appear were purged from the wallet.
+        for txid, tx in list(self._txs.items()):
+            if tx.height <= 0 and txid not in entries:
+                self._evict(txid)
+
+        # Only move the cursor forward once every tx in this window is
+        # indexed, so a transient decode failure is retried rather than lost.
+        if complete and result.get("lastblock"):
+            self._last_block = result["lastblock"]
+
+    def _evict(self, txid: str):
+        tx = self._txs.pop(txid, None)
+        if tx is None:
             return
-        current = {tx["txid"] for tx in result.get("transactions", [])
-                   if tx.get("confirmations", 1) <= 0}
+        for spk in tx.spks:
+            txids = self._spk_to_txids.get(spk)
+            if txids is not None:
+                txids.discard(txid)
+                if not txids:
+                    del self._spk_to_txids[spk]
 
-        # Evict txs that confirmed or dropped out of the mempool.
-        for txid in set(self._txid_to_spks) - current:
-            for spk in self._txid_to_spks.pop(txid):
-                txids = self._spk_to_txids.get(spk)
-                if txids is not None:
-                    txids.discard(txid)
-                    if not txids:
-                        del self._spk_to_txids[spk]
+    # -- per-tx lookups ------------------------------------------------
 
-        for txid in current - set(self._txid_to_spks):
-            spks = self._spks_touched(txid)
-            self._txid_to_spks[txid] = spks
-            for spk in spks:
-                self._spk_to_txids.setdefault(spk, set()).add(txid)
-
-    def _spks_touched(self, txid: str) -> set:
+    def _mempool_info(self, txid: str) -> Optional[Tuple[int, Optional[int]]]:
+        """(height, fee_sats) for a mempool tx, or None if it isn't in the mempool."""
         try:
-            tx = self.rpc.getrawtransaction(txid, True)
+            entry = self.rpc.call("getmempoolentry", txid)
         except RPCError:
-            return set()
+            return None
+        # Core returns fees in BTC under 'fees.base' (modern) or 'fee' (old).
+        fees = entry.get("fees") or {}
+        fee_btc = fees.get("base", entry.get("fee"))
+        fee_sats = int(round(fee_btc * 1e8)) if fee_btc is not None else None
+        # Electrum: -1 if any input is still unconfirmed, 0 otherwise.
+        height = -1 if entry.get("ancestorcount", 1) > 1 else 0
+        return height, fee_sats
+
+    def _spks_touched(self, txid: str, *, confirmed: bool) -> Optional[set]:
+        """Scripts paid to, or spent from, by wallet tx `txid`; None on RPC failure."""
+        try:
+            tx = self.rpc.call("gettransaction", txid, True, True)
+        except RPCError as e:
+            logger.debug(f"wallet index: gettransaction {txid} failed: {e}")
+            return None
+        decoded = tx.get("decoded") or {}
         spks = set()
-        for vout in tx.get("vout", []):
+        for vout in decoded.get("vout", []):
             spk = vout.get("scriptPubKey", {}).get("hex", "")
             if spk:
                 spks.add(spk.lower())
-        for vin in tx.get("vin", []):
-            prev_txid = vin.get("txid")
-            prev_n = vin.get("vout")
-            if prev_txid is None or prev_n is None:
-                continue   # coinbase
-            spk = self._prevout_spk(prev_txid, prev_n)
-            if spk:
-                spks.add(spk)
+        # gettransaction only reports 'fee' when the wallet funded at least
+        # one input. Without it no input is ours as far as the wallet knows,
+        # and the only way one could still be a watched script is a mempool
+        # tx spending a prevout imported too recently for the wallet to know
+        # about it — so confirmed txs skip the (failing) per-input lookups.
+        if "fee" in tx or not confirmed:
+            for vin in decoded.get("vin", []):
+                prev_txid, prev_n = vin.get("txid"), vin.get("vout")
+                if prev_txid is None or prev_n is None:
+                    continue   # coinbase
+                spk = self._prevout_spk(prev_txid, prev_n, deep=not confirmed)
+                if spk:
+                    spks.add(spk)
         return spks
 
-    def _prevout_spk(self, prev_txid: str, prev_n: int) -> Optional[str]:
-        # Confirmed prevouts are in the UTXO set (include_mempool=False so
-        # the pending spend doesn't hide them) — works without txindex.
+    def _prevout_spk(self, prev_txid: str, prev_n: int, *, deep: bool) -> Optional[str]:
+        # Inputs the wallet owns have their parent in the wallet; this works
+        # without -txindex and for pruned blocks.
+        try:
+            parent = self.rpc.call("gettransaction", prev_txid, True, True)
+            return self._vout_spk(parent.get("decoded") or {}, prev_n)
+        except (RPCError, KeyError, IndexError, TypeError):
+            pass
+        if not deep:
+            return None
+        # Confirmed prevout still in the UTXO set (include_mempool=False so
+        # the pending spend doesn't hide it) — works without txindex.
         try:
             txout = self.rpc.call("gettxout", prev_txid, prev_n, False)
         except RPCError:
@@ -194,11 +305,14 @@ class MempoolIndex:
                 return spk
         # Unconfirmed parent (or a txindex node): fall back to the raw tx.
         try:
-            prev = self.rpc.getrawtransaction(prev_txid, True)
-            spk = prev["vout"][prev_n].get("scriptPubKey", {}).get("hex", "")
-            return spk.lower() or None
-        except (RPCError, KeyError, IndexError):
+            return self._vout_spk(self.rpc.getrawtransaction(prev_txid, True), prev_n)
+        except (RPCError, KeyError, IndexError, TypeError):
             return None
+
+    @staticmethod
+    def _vout_spk(decoded: dict, n: int) -> Optional[str]:
+        spk = decoded["vout"][n].get("scriptPubKey", {}).get("hex", "")
+        return spk.lower() or None
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +365,7 @@ class ElectrumServer:
         self._clients_lock = threading.Lock()
 
         self._script_watcher = ScriptWatcher(rpc)
-        self._mempool_index = MempoolIndex(rpc)
+        self._wallet_index = WalletTxIndex(rpc)
 
         # Last pushed subscription status (spk hex -> status or None)
         self._status_cache: Dict[str, Optional[str]] = {}
@@ -698,97 +812,32 @@ class ElectrumServer:
             return {"height": 0, "hex": ""}
 
     def _get_history(self, *, spk_hex: str = None) -> List[dict]:
-        address, spk_hex = self._resolve_query(spk_hex=spk_hex)
-        if address is None and spk_hex is None:
-            logger.debug(f"No script known for query spk={spk_hex}")
+        if not spk_hex:
             return []
-        return self._get_history_for_script(address, spk_hex)
+        return self._get_history_for_script(spk_hex.lower().strip())
 
-    def _get_history_for_script(self, address: Optional[str], spk_hex: Optional[str]) -> List[dict]:
+    def _get_history_for_script(self, spk_hex: str) -> List[dict]:
         """
-        Return tx history for a script, combining several Bitcoin Core
-        RPCs because no single one is sufficient for a watch-only descriptor
-        wallet:
-
-          1. listunspent (per-address) — gives us txids of unspent receives.
-          2. listsinceblock — confirmed wallet activity (sends and receives).
-          3. MempoolIndex — attributes unconfirmed wallet txs (notably sends,
-             which listsinceblock reports under the *destination* address)
-             to the scripts their inputs/outputs touch.
+        Electrum-protocol history for a script, from the wallet tx index:
+          - confirmed entries first, in ascending height order
+          - mempool entries (height 0, or -1 with unconfirmed parents) last,
+            each carrying a non-negative integer `fee` in sats (required)
+        Ordering is deterministic so the status hash is stable between polls.
         """
-        seen: Dict[str, int] = {}  # txid -> height (0 = mempool)
-
-        try:
-            for u in self._utxos_for_script(address, spk_hex, 0, 9999999):
-                seen.setdefault(u["txid"],
-                                self._height_from_confs(u.get("confirmations", 0)))
-        except RPCError as e:
-            logger.debug(f"listunspent failed: {e}")
-
-        if address:
-            try:
-                result = self.rpc.call("listsinceblock", "", 1, True, True)
-                for tx in (result.get("transactions", [])
-                           + result.get("removed", [])):
-                    if tx.get("address") == address:
-                        seen.setdefault(
-                            tx["txid"],
-                            self._height_from_confs(tx.get("confirmations", 0)))
-            except RPCError as e:
-                logger.debug(f"listsinceblock failed: {e}")
-
-        if spk_hex:
-            for txid in self._mempool_index.txids_for_spk(spk_hex):
-                seen.setdefault(txid, 0)
-
-        # Electrum protocol requires:
-        #   - confirmed entries first, in ascending height order
-        #   - mempool entries (height <= 0) last
-        #   - mempool entries MUST contain a non-negative integer `fee` in sats
-        confirmed = sorted(
-            [(txid, h) for txid, h in seen.items() if h > 0],
-            key=lambda x: x[1],
-        )
-        mempool_items = [(txid, h) for txid, h in seen.items() if h <= 0]
-
+        items = self._wallet_index.history_for_spk(spk_hex)
+        confirmed = sorted(((txid, h) for txid, h, _fee in items if h > 0),
+                           key=lambda x: (x[1], x[0]))
         history: List[dict] = [
             {"tx_hash": txid, "height": h} for txid, h in confirmed
         ]
-        for txid, _h in mempool_items:
-            fee_sats = self._mempool_fee_sats(txid)
-            if fee_sats is None:
-                # No fee available (race: tx left mempool between getrawmempool
-                # and the fee lookup). Skip rather than violate the protocol.
+        for txid, h, fee in sorted(items, key=lambda x: x[0]):
+            if h > 0:
                 continue
-            history.append({
-                "tx_hash": txid,
-                "height": self._mempool_height(txid),
-                "fee": fee_sats,
-            })
+            if fee is None:
+                # Core reported no fee; skip rather than violate the protocol.
+                continue
+            history.append({"tx_hash": txid, "height": h, "fee": fee})
         return history
-
-    def _mempool_fee_sats(self, txid: str) -> Optional[int]:
-        """Return the fee (sats) for a mempool tx, or None if not in mempool
-        any more or the lookup fails."""
-        try:
-            entry = self.rpc.call("getmempoolentry", txid)
-        except RPCError:
-            return None
-        # Core returns fees in BTC under either 'fees.base' (modern) or 'fee'
-        # (very old releases).
-        fees = entry.get("fees") or {}
-        fee_btc = fees.get("base", entry.get("fee"))
-        if fee_btc is None:
-            return None
-        return int(round(fee_btc * 1e8))
-
-    def _mempool_height(self, txid: str) -> int:
-        """0 if all inputs are confirmed; -1 if any input is still in mempool."""
-        try:
-            entry = self.rpc.call("getmempoolentry", txid)
-        except RPCError:
-            return 0
-        return -1 if entry.get("ancestorcount", 1) > 1 else 0
 
     def _height_from_confs(self, confs: int) -> int:
         if confs is None or confs <= 0:
@@ -839,18 +888,11 @@ class ElectrumServer:
         utxos = self.rpc.listunspent(minconf, maxconf)
         return [u for u in utxos if self._utxo_matches_spk(u, spk_hex)]
 
-    def _utxo_matches_spk(self, utxo: dict, spk_hex: str) -> bool:
-        spk_hex = spk_hex.lower()
-        addr = utxo.get("address")
-        if addr and address_to_scripthash(addr) == scriptpubkey_to_scripthash(spk_hex):
-            return True
-        try:
-            tx = self.rpc.getrawtransaction(utxo["txid"], True)
-            vout = tx["vout"][utxo["vout"]]
-            script = vout.get("scriptPubKey", {}).get("hex", "")
-            return script.lower() == spk_hex
-        except (RPCError, KeyError, IndexError):
-            return False
+    @staticmethod
+    def _utxo_matches_spk(utxo: dict, spk_hex: str) -> bool:
+        # listunspent reports each output's scriptPubKey hex directly, so no
+        # address conversion or (txindex-dependent) getrawtransaction needed.
+        return (utxo.get("scriptPubKey") or "").lower() == spk_hex.lower()
 
     def _history_status(self, history: List[dict]) -> Optional[str]:
         if not history:
