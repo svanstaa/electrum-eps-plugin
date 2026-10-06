@@ -587,6 +587,23 @@ class TestWalletTxIndex(unittest.TestCase):
         server._wallet_index.history_for_spk.assert_called_once_with(self.SPK_A)
 
 
+class TestServerLifecycle(unittest.TestCase):
+
+    def test_bind_failure_raises_from_start(self):
+        import socket as _socket
+        blocker = _socket.socket()
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        try:
+            server = ElectrumServer(MagicMock(spec=BitcoinRPC),
+                                    "127.0.0.1", port)
+            with self.assertRaises(OSError):
+                server.start()
+        finally:
+            blocker.close()
+
+
 class TestPushScriptNotifications(unittest.TestCase):
     """Notification identifiers per finalized protocol 1.7: scriptpubkey
     subs are keyed by scripthash(spk) — Electrum's interface converts

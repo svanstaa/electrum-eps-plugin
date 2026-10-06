@@ -380,6 +380,16 @@ class ElectrumServer:
     # ------------------------------------------------------------------
 
     def start(self):
+        # Bind + listen synchronously so a port conflict (e.g. an original
+        # EPS instance, which uses the same default port) fails loudly here
+        # instead of killing a daemon thread after start() returned success.
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        raw_sock.bind((self.host, self.port))
+        raw_sock.listen(5)
+        raw_sock.settimeout(1.0)   # so the accept loop can check _stop_event
+        self._server_sock = raw_sock
+
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="eps-server-main")
@@ -404,12 +414,7 @@ class ElectrumServer:
     # ------------------------------------------------------------------
 
     def _run(self):
-        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        raw_sock.bind((self.host, self.port))
-        raw_sock.listen(5)
-        raw_sock.settimeout(1.0)   # so we can check _stop_event
-        self._server_sock = raw_sock
+        raw_sock = self._server_sock
 
         if self.certfile and self.keyfile:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
