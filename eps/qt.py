@@ -255,6 +255,8 @@ class Plugin(BasePlugin):
         self._log_widget: Optional[QTextEdit] = None
         self._prev_network_settings = None
         self._eps_scheme = "s"
+        self._import_thread: Optional[QThread] = None
+        self._import_worker: Optional[ImportWorker] = None
 
         self._status_bridge = _StatusBridge()
         self._status_bridge.status_changed.connect(self._apply_status_in_gui_thread)
@@ -681,6 +683,15 @@ class Plugin(BasePlugin):
             QMessageBox.warning(
                 parent or window or self._active_window,
                 "EPS", _("No wallet open."))
+            return
+
+        # Refuse a second job while one is running: overwriting the only
+        # reference to a live QThread makes Qt abort the whole process when
+        # the wrapper is garbage-collected.
+        if self._import_thread is not None and self._import_thread.isRunning():
+            QMessageBox.information(
+                parent or window, "EPS",
+                _("An import & rescan is already running."))
             return
 
         wallet = window.wallet
