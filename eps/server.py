@@ -661,8 +661,32 @@ class ElectrumServer:
 
     def _method_blockchain_transaction_get(self, params, peer):
         txid = params[0]
-        verbose = params[1] if len(params) > 1 else False
-        return self.rpc.getrawtransaction(txid, verbose)
+        verbose = bool(params[1]) if len(params) > 1 else False
+        return self._get_transaction(txid, verbose)
+
+    def _get_transaction(self, txid: str, verbose: bool):
+        """
+        Fetch a transaction without requiring -txindex.
+
+        Electrum only asks for txids it saw in a history we served, and every
+        one of those is a wallet tx, so the wallet RPC gettransaction is tried
+        first: it serves confirmed txs on default and pruned nodes alike.
+        getrawtransaction is the fallback for mempool txs that don't involve
+        the wallet (and anything else on a txindex node).
+        """
+        try:
+            tx = self.rpc.call("gettransaction", txid, True, verbose)
+        except RPCError:
+            return self.rpc.getrawtransaction(txid, verbose)
+        if not verbose:
+            return tx["hex"]
+        # Approximate getrawtransaction's verbose shape from what the wallet has.
+        decoded = dict(tx.get("decoded") or {})
+        decoded.setdefault("hex", tx.get("hex"))
+        for key in ("blockhash", "blockheight", "blocktime", "confirmations", "time"):
+            if key in tx:
+                decoded.setdefault(key, tx[key])
+        return decoded
 
     def _method_blockchain_transaction_get_merkle(self, params, peer):
         txid = params[0]

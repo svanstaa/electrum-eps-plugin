@@ -251,6 +251,52 @@ class TestBlockHeaders(unittest.TestCase):
         self.assertEqual(len(result["headers"]), 3)
         self.assertEqual(len(result["headers"][0]), 160)
 
+class TestTransactionGet(unittest.TestCase):
+    """blockchain.transaction.get must not depend on -txindex: wallet txs are
+    served via gettransaction, with getrawtransaction only as a fallback."""
+
+    TXID = "33" * 32
+
+    def setUp(self):
+        self.server = _make_server()
+
+    def _dispatch(self, params):
+        return self.server._dispatch(
+            {"id": 1, "method": "blockchain.transaction.get", "params": params},
+            "peer")
+
+    def test_wallet_tx_served_from_gettransaction(self):
+        self.server.rpc.call.return_value = {"hex": "beef", "confirmations": 3}
+        resp = self._dispatch([self.TXID])
+        self.assertEqual(resp["result"], "beef")
+        self.server.rpc.call.assert_called_once_with(
+            "gettransaction", self.TXID, True, False)
+        self.server.rpc.getrawtransaction.assert_not_called()
+
+    def test_non_wallet_tx_falls_back_to_getrawtransaction(self):
+        self.server.rpc.call.side_effect = RPCError(
+            -5, "Invalid or non-wallet transaction id")
+        self.server.rpc.getrawtransaction.return_value = "cafe"
+        resp = self._dispatch([self.TXID])
+        self.assertEqual(resp["result"], "cafe")
+        self.server.rpc.getrawtransaction.assert_called_once_with(self.TXID, False)
+
+    def test_verbose_composes_decoded_with_wallet_metadata(self):
+        self.server.rpc.call.return_value = {
+            "hex": "beef", "confirmations": 3, "blockhash": "bh",
+            "blockheight": 98, "blocktime": 1700000000, "time": 1699999999,
+            "decoded": {"txid": self.TXID, "vout": []},
+        }
+        resp = self._dispatch([self.TXID, True])
+        self.server.rpc.call.assert_called_once_with(
+            "gettransaction", self.TXID, True, True)
+        result = resp["result"]
+        self.assertEqual(result["txid"], self.TXID)
+        self.assertEqual(result["hex"], "beef")
+        self.assertEqual(result["confirmations"], 3)
+        self.assertEqual(result["blockhash"], "bh")
+
+
 class TestUtxoMatchesSpk(unittest.TestCase):
 
     def test_matches_on_listunspent_scriptpubkey_field_without_rpc(self):
