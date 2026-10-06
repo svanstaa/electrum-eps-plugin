@@ -19,6 +19,7 @@ from eps.rpc import BitcoinRPC, RPCError
 from eps.server import (
     ElectrumServer, ClientState, WalletTxIndex, _merkle_branch,
     _negotiate_protocol, PROTOCOL_VERSION_MIN, PROTOCOL_VERSION_MAX,
+    BLOCK_HEADERS_MAX,
 )
 
 
@@ -48,6 +49,11 @@ class TestDispatch(unittest.TestCase):
     def test_server_ping_pong_len(self):
         resp = self._dispatch("server.ping", [32, "aa"])
         self.assertEqual(resp["result"], {"data": "0" * 32})
+
+    def test_server_ping_pong_len_capped(self):
+        resp = self._dispatch("server.ping", [10 ** 9])
+        self.assertIn("error", resp)
+        self.assertEqual(resp["error"]["code"], 1)
 
     def test_non_object_request_gets_invalid_request(self):
         # A JSON array/scalar line must not kill the connection (R2).
@@ -274,6 +280,17 @@ class TestBlockHeaders(unittest.TestCase):
         self.assertEqual(len(result["headers"][0]), 160)
         self.server.rpc.getblockheader.assert_any_call("hash90", False)
         self.server.rpc.getblock.assert_not_called()
+
+    def test_block_headers_count_clamped_to_max(self):
+        self.server.rpc.getblockcount.return_value = 10_000
+        result = self._dispatch("blockchain.block.headers", [0, 10 ** 6])["result"]
+        self.assertEqual(result["count"], BLOCK_HEADERS_MAX)
+        self.assertEqual(self.server.rpc.getblockheader.call_count, BLOCK_HEADERS_MAX)
+
+    def test_block_headers_negative_start_rejected(self):
+        resp = self._dispatch("blockchain.block.headers", [-1, 5])
+        self.assertIn("error", resp)
+        self.server.rpc.getblockheader.assert_not_called()
 
     def test_block_header_single(self):
         result = self._dispatch("blockchain.block.header", [42])["result"]

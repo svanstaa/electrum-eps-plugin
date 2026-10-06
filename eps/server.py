@@ -33,6 +33,13 @@ PROTOCOL_VERSION_MAX = "1.7"
 PROTOCOL_VERSION = PROTOCOL_VERSION_MIN  # default for legacy callers
 SERVER_VERSION = "EPS-plugin/0.1.0"
 BLOCK_HEADERS_MAX = 2016
+# Incoming lines are newline-delimited JSON-RPC. Electrum's requests are
+# small; anything larger is either a broadcast (max ~100 kvB standard) or
+# abuse. 1 MiB leaves generous headroom.
+MAX_LINE_BYTES = 1024 * 1024
+# server.ping's optional pong-length parameter: cap the echo so a client
+# cannot make us allocate arbitrarily large responses.
+PING_PONG_MAX = 4096
 
 
 def _protocol_tuple(version: str) -> tuple:
@@ -497,6 +504,9 @@ class ElectrumServer:
                 if not chunk:
                     break
                 buf += chunk
+                if len(buf) > MAX_LINE_BYTES:
+                    logger.warning(f"{peer}: line exceeds {MAX_LINE_BYTES} bytes, disconnecting")
+                    break
 
                 # Electrum protocol: newline-delimited JSON
                 while b"\n" in buf:
@@ -638,6 +648,8 @@ class ElectrumServer:
 
     def _method_server_ping(self, params, peer):
         pong_len = int(params[0]) if params else 0
+        if not 0 <= pong_len <= PING_PONG_MAX:
+            raise ElectrumServerError(f"pong length must be 0..{PING_PONG_MAX}")
         return {"data": "0" * pong_len}
 
     def _method_server_peers_subscribe(self, params, peer):
@@ -763,6 +775,9 @@ class ElectrumServer:
     def _method_blockchain_block_headers(self, params, peer):
         start = int(params[0])
         count = int(params[1])
+        if start < 0 or count < 0:
+            raise ElectrumServerError("start_height and count must be non-negative")
+        count = min(count, BLOCK_HEADERS_MAX)
         try:
             tip = self.rpc.getblockcount()
         except RPCError:
