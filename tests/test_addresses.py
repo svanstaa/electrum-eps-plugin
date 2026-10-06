@@ -307,6 +307,68 @@ class TestHeightForTimestamp(unittest.TestCase):
         self.assertEqual(height_for_timestamp(self._rpc(), ts), 0)
 
 
+class TestBranchImportCount(unittest.TestCase):
+    """The bulk-import range follows the wallet's actual usage (M6), with a
+    floor at IMPORT_ADDRESS_COUNT and headroom for unused-but-handed-out
+    addresses."""
+
+    class _Wallet:
+        def __init__(self, recv=None, change=None):
+            self._recv = recv
+            self._change = change
+
+        def num_receiving_addresses(self):
+            if self._recv is None:
+                raise RuntimeError("n/a")
+            return self._recv
+
+        def num_change_addresses(self):
+            if self._change is None:
+                raise RuntimeError("n/a")
+            return self._change
+
+    def _count(self, wallet):
+        from eps.addresses import _branch_import_count
+        return _branch_import_count(wallet)
+
+    def test_default_when_wallet_exposes_nothing(self):
+        from eps.addresses import IMPORT_ADDRESS_COUNT
+        self.assertEqual(self._count(object()), IMPORT_ADDRESS_COUNT)
+        self.assertEqual(self._count(self._Wallet()), IMPORT_ADDRESS_COUNT)
+
+    def test_floor_at_default(self):
+        from eps.addresses import IMPORT_ADDRESS_COUNT
+        self.assertEqual(self._count(self._Wallet(5, 3)), IMPORT_ADDRESS_COUNT)
+
+    def test_scales_with_usage_plus_headroom(self):
+        from eps.addresses import IMPORT_GAP_HEADROOM
+        self.assertEqual(self._count(self._Wallet(250, 40)),
+                         250 + IMPORT_GAP_HEADROOM)
+        self.assertEqual(self._count(self._Wallet(40, 900)),
+                         900 + IMPORT_GAP_HEADROOM)
+
+    def test_import_uses_wallet_sized_range(self):
+        from eps.addresses import AddressImporter, IMPORT_GAP_HEADROOM
+
+        class _KS:
+            xpub = "xpubABC"
+
+        class _W(self._Wallet):
+            wallet_type = "standard"
+
+            def get_keystores(self):
+                return [_KS()]
+
+        with patch("eps.addresses._to_canonical_xpub", side_effect=lambda x: x):
+            imp = AddressImporter(MagicMock())
+            imp.rpc.getnetworkinfo.return_value = {"version": 210000}
+            imp.rpc.importdescriptors.return_value = [{"success": True}]
+            imp.import_wallet(_W(recv=300, change=10))
+            for call in imp.rpc.importdescriptors.call_args_list:
+                self.assertEqual(call[0][0][0]["range"],
+                                 [0, 300 + IMPORT_GAP_HEADROOM - 1])
+
+
 class TestAlreadyImportedError(unittest.TestCase):
 
     def test_matches_already_exists(self):

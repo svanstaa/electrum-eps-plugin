@@ -24,10 +24,38 @@ _XPUB_TYPE_TO_SCRIPT = {
     "p2wpkh":     "wpkh",    # zpub  → P2WPKH (native segwit)
 }
 
-# How many addresses to bulk-import into Core per branch (receiving/change).
-# With protocol 1.7, anything beyond this range is still picked up on demand
-# via scriptpubkey.subscribe, so this only bounds the initial import + rescan.
+# How many addresses to bulk-import into Core per branch (receiving/change)
+# when the wallet's own usage cannot be determined. With protocol 1.7,
+# anything beyond the imported range is still picked up on demand via
+# scriptpubkey.subscribe — but with timestamp 'now', so its *history* never
+# appears. The import range is therefore sized from the wallet's actual
+# usage (see _branch_import_count) so the rescan covers every address the
+# wallet has ever used.
 IMPORT_ADDRESS_COUNT = 100
+
+# Extra headroom beyond the wallet's highest used index, so a rescan also
+# covers addresses the user has handed out but not yet received on.
+IMPORT_GAP_HEADROOM = 20
+
+
+def _branch_import_count(wallet) -> int:
+    """How many addresses per branch (receiving/change) to import.
+
+    Based on how many addresses the Electrum wallet has actually derived,
+    plus headroom. Falls back to IMPORT_ADDRESS_COUNT when the wallet does
+    not expose its address counts (or exposes none yet).
+    """
+    counts = []
+    for attr in ("num_receiving_addresses", "num_change_addresses"):
+        fn = getattr(wallet, attr, None)
+        if callable(fn):
+            try:
+                counts.append(int(fn()))
+            except Exception:
+                pass
+    if not counts:
+        return IMPORT_ADDRESS_COUNT
+    return max(IMPORT_ADDRESS_COUNT, max(counts) + IMPORT_GAP_HEADROOM)
 
 
 def _script_type_for_keystore(ks) -> str:
@@ -371,6 +399,7 @@ class AddressImporter:
         if _is_multisig_wallet(wallet):
             return self._import_multisig(wallet, progress)
 
+        count = _branch_import_count(wallet)
         imported_any = False
         for i, ks in enumerate(keystores):
             if not hasattr(ks, 'xpub') or not ks.xpub:
@@ -378,7 +407,7 @@ class AddressImporter:
                 continue
 
             progress(f"Keystore {i}: importing addresses for {ks.xpub[:16]}…")
-            newly_imported = self._import_keystore(ks, progress)
+            newly_imported = self._import_keystore(ks, progress, count)
             if newly_imported:
                 imported_any = True
 
@@ -408,7 +437,7 @@ class AddressImporter:
 
         m = _multisig_threshold(wallet)
         txin_type = getattr(wallet, "txin_type", "p2wsh") or "p2wsh"
-        count = IMPORT_ADDRESS_COUNT
+        count = _branch_import_count(wallet)
 
         imported_any = False
         for change in (0, 1):
@@ -424,11 +453,10 @@ class AddressImporter:
 
         return imported_any
 
-    def _import_keystore(self, ks, progress_cb) -> bool:
+    def _import_keystore(self, ks, progress_cb, count: int) -> bool:
         """Import one keystore's receiving and change addresses."""
         xpub = ks.xpub
         script_type = _script_type_for_keystore(ks)
-        count = IMPORT_ADDRESS_COUNT
 
         newly_imported = False
 
