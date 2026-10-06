@@ -1037,17 +1037,24 @@ class ElectrumServer:
 
     def _notification_loop(self):
         """
-        Poll Bitcoin Core every ~10 seconds. On new blocks, push header
+        Poll Bitcoin Core every ~10 seconds. On new blocks — including
+        same-height reorgs, which leave the height unchanged — push header
         notifications and refresh script subscription statuses.
         """
         while not self._stop_event.is_set():
             try:
                 height = self.rpc.getblockcount()
+                tip_hash = self.rpc.getblockhash(height)
                 with self._tip_lock:
-                    new_block = height != self._tip_height
+                    new_block = ((height, tip_hash)
+                                 != (self._tip_height, self._tip_hash))
                     if new_block:
                         self._tip_height = height
-                        self._push_header_notification(height)
+                        self._tip_hash = tip_hash
+                # Push outside the lock: it involves a blocking RPC and
+                # socket sends to every subscribed client.
+                if new_block:
+                    self._push_header_notification(height)
                 self._push_script_notifications()
             except Exception as e:
                 logger.debug(f"Notification loop error: {e}")

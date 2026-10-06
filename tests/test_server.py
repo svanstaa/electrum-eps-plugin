@@ -714,6 +714,46 @@ class TestServerLifecycle(unittest.TestCase):
                 server.stop()
 
 
+class TestNotificationLoop(unittest.TestCase):
+    """M3: a same-height reorg (new tip hash, unchanged height) must push a
+    header notification just like a height increase."""
+
+    def _run_one_poll(self, server):
+        # Let the loop body run exactly once, then stop.
+        server._stop_event.wait = lambda timeout: server._stop_event.set() or True
+        server._notification_loop()
+        server._stop_event.clear()
+
+    def _server(self):
+        server = _make_server()
+        server.rpc.getblockcount.return_value = 100
+        server.rpc.getblockhash.return_value = "hashA"
+        server._pushed = []
+        server._push_header_notification = lambda h: server._pushed.append(h)
+        server._push_script_notifications = lambda: None
+        return server
+
+    def test_new_tip_pushes_header(self):
+        server = self._server()
+        self._run_one_poll(server)
+        self.assertEqual(server._pushed, [100])
+
+    def test_same_height_new_hash_pushes_header(self):
+        server = self._server()
+        self._run_one_poll(server)
+        server._pushed.clear()
+        server.rpc.getblockhash.return_value = "hashB"   # reorg at height 100
+        self._run_one_poll(server)
+        self.assertEqual(server._pushed, [100])
+
+    def test_unchanged_tip_pushes_nothing(self):
+        server = self._server()
+        self._run_one_poll(server)
+        server._pushed.clear()
+        self._run_one_poll(server)
+        self.assertEqual(server._pushed, [])
+
+
 class TestPushScriptNotifications(unittest.TestCase):
     """Notification identifiers per finalized protocol 1.7: scriptpubkey
     subs are keyed by scripthash(spk) — Electrum's interface converts
