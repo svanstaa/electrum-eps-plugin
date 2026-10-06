@@ -187,6 +187,20 @@ embedded server's address.
   only and cannot connect.
 - One Electrum client at a time is the design assumption (multiple work,
   but there is no per-client deduplication of work).
+- The embedded server is unauthenticated on `127.0.0.1` (the Electrum
+  protocol has no auth; original EPS shares this model). Unlike EPS,
+  however, this plugin *writes* to your Core wallet on client input:
+  any local process can import watch-only descriptors (size-capped per
+  request, but not rate-limited), broadcast transactions through your
+  node, or query history for scripts it can guess. On a single-user
+  machine this is fine; on a shared machine, treat local users as
+  trusted.
+- The notifier thread writes to client TLS sockets while client threads
+  read from them. OpenSSL connections are not formally safe for
+  simultaneous cross-thread use; a failure would drop the connection
+  rather than corrupt data, and none has been observed, but the proper
+  fix (a per-client outbound queue so only one thread touches each
+  socket) is planned.
 - Lightning is not supported.
 
 ## Running tests
