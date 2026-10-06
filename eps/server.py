@@ -537,10 +537,18 @@ class ElectrumServer:
     # Method dispatch
     # ------------------------------------------------------------------
 
-    def _dispatch(self, request: dict, peer: str) -> Optional[dict]:
+    def _dispatch(self, request, peer: str) -> Optional[dict]:
+        # Validate the envelope before touching it: a JSON array/scalar line
+        # must get an Invalid Request reply, not kill the connection.
+        if not isinstance(request, dict):
+            logger.warning(f"{peer}: non-object request, ignoring")
+            return self._error(None, -32600, "Invalid Request: expected a JSON object")
         req_id = request.get("id")
         method = request.get("method", "")
         params = request.get("params", [])
+        if not isinstance(method, str) or not isinstance(params, list):
+            return self._error(req_id, -32600,
+                               "Invalid Request: 'method' must be a string, 'params' a list")
 
         handler = self._methods.get(method)
         if handler is None:

@@ -49,6 +49,19 @@ class TestDispatch(unittest.TestCase):
         resp = self._dispatch("server.ping", [32, "aa"])
         self.assertEqual(resp["result"], {"data": "0" * 32})
 
+    def test_non_object_request_gets_invalid_request(self):
+        # A JSON array/scalar line must not kill the connection (R2).
+        resp = self.server._dispatch([], "peer")
+        self.assertEqual(resp["error"]["code"], -32600)
+        self.assertIsNone(resp["id"])
+        resp = self.server._dispatch("hello", "peer")
+        self.assertEqual(resp["error"]["code"], -32600)
+
+    def test_non_list_params_gets_invalid_request(self):
+        resp = self.server._dispatch(
+            {"id": 1, "method": "server.ping", "params": {"x": 1}}, "peer")
+        self.assertEqual(resp["error"]["code"], -32600)
+
     def test_server_features_protocol_range(self):
         self.server.rpc.getblockhash.return_value = "00" * 32
         resp = self._dispatch("server.features")
