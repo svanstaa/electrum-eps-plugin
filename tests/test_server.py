@@ -68,16 +68,23 @@ class TestDispatch(unittest.TestCase):
             {"id": 1, "method": "server.ping", "params": {"x": 1}}, "peer")
         self.assertEqual(resp["error"]["code"], -32600)
 
-    def test_bad_params_are_invalid_params_not_internal_error(self):
+    def test_missing_params_is_invalid_params_not_internal_error(self):
         # R5: bad client input maps to -32602, not a -32603 traceback.
         resp = self._dispatch("blockchain.scriptpubkey.get_history")
-        self.assertEqual(resp["error"]["code"], -32602)
+        self.assertEqual(resp["error"]["code"], 1)   # "scriptPubKey required"
         resp = self._dispatch("blockchain.scriptpubkey.get_history", [123])
-        self.assertEqual(resp["error"]["code"], -32602)
+        self.assertEqual(resp["error"]["code"], 1)
         resp = self._dispatch("blockchain.scriptpubkey.subscribe", ["zz"])
         self.assertEqual(resp["error"]["code"], -32602)  # hex validation
         resp = self._dispatch("server.ping", ["abc"])
         self.assertEqual(resp["error"]["code"], -32602)
+
+    def test_oversized_scriptpubkey_rejected_before_import(self):
+        self.server._script_watcher.ensure_watched = MagicMock()
+        resp = self._dispatch("blockchain.scriptpubkey.subscribe",
+                              ["00" * 20_001])
+        self.assertIn("error", resp)
+        self.server._script_watcher.ensure_watched.assert_not_called()
 
     def test_server_features_protocol_range(self):
         self.server.rpc.getblockhash.return_value = "00" * 32

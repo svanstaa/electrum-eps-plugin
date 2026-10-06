@@ -40,6 +40,10 @@ MAX_LINE_BYTES = 1024 * 1024
 # server.ping's optional pong-length parameter: cap the echo so a client
 # cannot make us allocate arbitrarily large responses.
 PING_PONG_MAX = 4096
+# scriptPubKey scripts: standard outputs are <= 83 bytes; 10,000 is the
+# consensus script size limit and bounds what a client can make us import
+# into the Core wallet per request.
+MAX_SPK_BYTES = 10_000
 
 
 def _protocol_tuple(version: str) -> tuple:
@@ -666,10 +670,20 @@ class ElectrumServer:
                 entry[1].headers_sub = True
         return self._current_header()
 
+    @staticmethod
+    def _spk_param(params) -> str:
+        """Extract and validate the scriptPubKey hex that starts every
+        blockchain.scriptpubkey.* request."""
+        if not params or not isinstance(params[0], str):
+            raise ElectrumServerError("scriptPubKey hex parameter required")
+        spk_hex = params[0].strip().lower()
+        if len(spk_hex) > 2 * MAX_SPK_BYTES:
+            raise ElectrumServerError(
+                f"scriptPubKey too long (max {MAX_SPK_BYTES} bytes)")
+        return spk_hex
+
     def _method_blockchain_scriptpubkey_subscribe(self, params, peer):
-        if not params:
-            raise ElectrumServerError("scriptPubKey required")
-        spk_hex = params[0].lower().strip()
+        spk_hex = self._spk_param(params)
         self._script_watcher.ensure_watched(spk_hex)
         t = threading.current_thread()
         with self._clients_lock:
@@ -679,18 +693,18 @@ class ElectrumServer:
         return self._spk_status(spk_hex)
 
     def _method_blockchain_scriptpubkey_get_history(self, params, peer):
-        spk_hex = params[0].lower().strip()
+        spk_hex = self._spk_param(params)
         self._script_watcher.ensure_watched(spk_hex)
         # Finalized protocol 1.7 wraps the list in a dict (electrum-protocol PR #17).
         return {"history": self._get_history(spk_hex=spk_hex)}
 
     def _method_blockchain_scriptpubkey_get_balance(self, params, peer):
-        spk_hex = params[0].lower().strip()
+        spk_hex = self._spk_param(params)
         self._script_watcher.ensure_watched(spk_hex)
         return self._get_balance(spk_hex=spk_hex)
 
     def _method_blockchain_scriptpubkey_listunspent(self, params, peer):
-        spk_hex = params[0].lower().strip()
+        spk_hex = self._spk_param(params)
         self._script_watcher.ensure_watched(spk_hex)
         # Finalized protocol 1.7 wraps the list in a dict (electrum-protocol PR #17).
         return {"utxos": self._listunspent(spk_hex=spk_hex)}
@@ -703,11 +717,13 @@ class ElectrumServer:
         # Finalized 1.7: client always sends the outpoint's scriptPubKey as a
         # third param. Import it so Core tracks the output even if we've never
         # seen its address before (needed for gettxout on foreign outpoints).
-        if len(params) > 2 and params[2]:
-            try:
-                self._script_watcher.ensure_watched(str(params[2]).lower().strip())
-            except Exception as e:
-                logger.debug(f"outpoint.subscribe: spk_hint import failed: {e}")
+        if len(params) > 2 and isinstance(params[2], str) and params[2]:
+            hint = params[2].strip().lower()
+            if len(hint) <= 2 * MAX_SPK_BYTES:
+                try:
+                    self._script_watcher.ensure_watched(hint)
+                except Exception as e:
+                    logger.debug(f"outpoint.subscribe: spk_hint import failed: {e}")
         t = threading.current_thread()
         with self._clients_lock:
             entry = self._clients.get(t)
