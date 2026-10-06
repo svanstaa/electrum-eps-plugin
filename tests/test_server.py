@@ -62,6 +62,17 @@ class TestDispatch(unittest.TestCase):
             {"id": 1, "method": "server.ping", "params": {"x": 1}}, "peer")
         self.assertEqual(resp["error"]["code"], -32600)
 
+    def test_bad_params_are_invalid_params_not_internal_error(self):
+        # R5: bad client input maps to -32602, not a -32603 traceback.
+        resp = self._dispatch("blockchain.scriptpubkey.get_history")
+        self.assertEqual(resp["error"]["code"], -32602)
+        resp = self._dispatch("blockchain.scriptpubkey.get_history", [123])
+        self.assertEqual(resp["error"]["code"], -32602)
+        resp = self._dispatch("blockchain.scriptpubkey.subscribe", ["zz"])
+        self.assertEqual(resp["error"]["code"], -32602)  # hex validation
+        resp = self._dispatch("server.ping", ["abc"])
+        self.assertEqual(resp["error"]["code"], -32602)
+
     def test_server_features_protocol_range(self):
         self.server.rpc.getblockhash.return_value = "00" * 32
         resp = self._dispatch("server.features")

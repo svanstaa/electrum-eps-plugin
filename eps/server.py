@@ -564,6 +564,12 @@ class ElectrumServer:
             # client and is treated as disconnect-worthy in some contexts.
             logger.warning(f"{peer} -> {method}: {e}")
             return self._error(req_id, 1, str(e))
+        except (ValueError, IndexError, TypeError, AttributeError) as e:
+            # Bad client input (missing/mistyped params, invalid hex): tell
+            # the client its request was wrong instead of logging a traceback
+            # and claiming an internal error.
+            logger.debug(f"{peer} -> {method}: invalid params: {e}")
+            return self._error(req_id, -32602, f"Invalid params: {e}")
         except RPCError as e:
             logger.warning(f"{peer} -> {method}: RPC error: {e}")
             return self._error(req_id, e.code, e.message)
