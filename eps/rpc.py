@@ -7,6 +7,7 @@ import json
 import base64
 import logging
 import os
+import urllib.parse
 import urllib.request
 import urllib.error
 from typing import Any
@@ -56,9 +57,14 @@ class BitcoinRPC:
 
     def __init__(self, host: str, port: int, user: str, password: str,
                  wallet: str = ""):
+        host = (host or "").strip()
+        # Bracket IPv6 literals (urlparse().hostname strips them).
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
         self._url = f"http://{host}:{port}"
         if wallet:
-            self._url += f"/wallet/{wallet}"
+            # Wallet names may contain spaces, slashes, unicode — encode.
+            self._url += f"/wallet/{urllib.parse.quote(wallet, safe='')}"
         creds = base64.b64encode(f"{user}:{password}".encode()).decode()
         self._headers = {
             "Content-Type": "application/json",

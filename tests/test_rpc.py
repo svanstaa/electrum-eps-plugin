@@ -58,6 +58,22 @@ class TestBitcoinRPC(unittest.TestCase):
         req = call_args[0][0]
         self.assertIn("/wallet/eps", req.full_url)
 
+    @patch("urllib.request.urlopen")
+    def test_wallet_name_is_percent_encoded(self, mock_urlopen):
+        rpc = BitcoinRPC("127.0.0.1", 8332, "u", "p", wallet="my wallet/x")
+        mock_urlopen.return_value = _mock_response(result={})
+        rpc.getwalletinfo()
+        req = mock_urlopen.call_args[0][0]
+        self.assertIn("/wallet/my%20wallet%2Fx", req.full_url)
+
+    @patch("urllib.request.urlopen")
+    def test_ipv6_host_is_bracketed(self, mock_urlopen):
+        rpc = BitcoinRPC("::1", 8332, "u", "p")
+        mock_urlopen.return_value = _mock_response(result=1)
+        rpc.getblockcount()
+        req = mock_urlopen.call_args[0][0]
+        self.assertIn("http://[::1]:8332", req.full_url)
+
     @staticmethod
     def _http_error(code, body=b"", content_type="text/plain"):
         import urllib.error
