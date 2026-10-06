@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write   # needed by action-gh-release to attach the zip
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,14 +21,16 @@ jobs:
         with:
           python-version: '3.11'
 
+      # The plugin targets Electrum protocol 1.7, which no released Electrum
+      # speaks yet; pin the branch that does instead of tracking master.
       - name: Clone Electrum (for make_plugin)
         run: |
-          git clone --depth=1 https://github.com/spesmilo/electrum
+          git clone --depth=1 --branch protocol_1.7 https://github.com/spesmilo/electrum
 
       - name: Build plugin zip
         run: |
           cd electrum
-          pip install pyqt5 cryptography  # needed by make_plugin
+          pip install -r contrib/requirements/requirements.txt cryptography
           ./contrib/make_plugin ../eps
 
       - name: Upload release asset
